@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BLE SAR Ground Station</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #121922;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --accent: #4da3ff;
+    --known: #2ecc71;
+    --unknown: #ff5555;
+    --ignore: #6b7280;
+    --border: #22303c;
+  }
+  html.night {
+    --bg: #000000;
+    --panel: #0a0000;
+    --text: #ff5c5c;
+    --muted: #7a2222;
+    --accent: #ff5c5c;
+    --known: #7a3a3a;
+    --unknown: #ff2222;
+    --ignore: #552222;
+    --border: #330000;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; margin: 0; }
+  .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--unknown); display: inline-block;
+  }
+  .dot.connected { background: var(--known); }
+  button, .btn {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 6px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    text-decoration: none;
+  }
+  button:hover, .btn:hover { border-color: var(--accent); }
+  label { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  #search {
+    margin-left: auto;
+  }
+  #search input {
+    width: 220px;
+  }
+  main {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1px;
+    background: var(--border);
+  }
+  #map-panel, #table-panel {
+    background: var(--bg);
+    flex: 1 1 480px;
+    min-width: 320px;
+  }
+  #map-panel { padding: 12px; }
+  #map {
+    width: 100%; height: 60vh; background: var(--panel); border-radius: 8px;
+  }
+  .leaflet-container { background: var(--panel); }
+  .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: var(--panel); color: var(--text); }
+  .leaflet-control-zoom a { background: var(--panel) !important; color: var(--text) !important; border-color: var(--border) !important; }
+  #table-panel { padding: 12px; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--bg); }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--text); }
+  th.sortable .arrow { display: inline-block; width: 1em; opacity: 0.6; }
+  tr.row-unknown { background: color-mix(in srgb, var(--unknown) 12%, transparent); }
+  tr.row-highlight { outline: 1px solid var(--accent); }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px;
+    font-weight: 600; color: #04140a;
+  }
+  .badge.known { background: var(--known); }
+  .badge.unknown { background: var(--unknown); color: #200000; }
+  .badge.ignore { background: var(--ignore); color: #eee; }
+  .badge.vendor {
+    background: transparent; border: 1px solid var(--accent); color: var(--accent);
+  }
+  .badge.vendor.medium { opacity: 0.65; }
+  input[type=text] {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    border-radius: 4px; padding: 4px 6px; font-size: 12px; width: 130px;
+  }
+  select {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    border-radius: 4px; padding: 4px; font-size: 12px;
+  }
+  .muted { color: var(--muted); }
+  .empty { padding: 24px; text-align: center; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="conn-dot"></span>
+  <h1>BLE SAR Ground Station</h1>
+  <label><input type="checkbox" id="filter-new"> Show only untagged</label>
+  <label><input type="checkbox" id="show-heatmap"> Hit density heatmap</label>
+  <button id="night-toggle">Night mode</button>
+  <a class="btn" href="/api/kmz">Export KMZ</a>
+  <button id="bulk-known" title="Tag every currently visible device as known">Mark all known</button>
+  <button id="bulk-ignore" title="Tag every currently visible device as ignore">Ignore all</button>
+  <button id="reset-db" title="Delete ALL detections and tags">Reset Database</button>
+  <span id="search"><input type="text" id="search-input" placeholder="Search MAC / name / label"></span>
+</header>
+<main>
+  <div id="map-panel">
+    <div id="map"></div>
+    <p class="muted" id="map-caption"></p>
+  </div>
+  <div id="table-panel">
+    <p class="muted" id="freeze-banner" style="display:none">
+      Selection locked so you can edit without the list moving — click the row again to release it.
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th class="sortable" data-field="status">Status <span class="arrow"></span></th>
+          <th class="sortable" data-field="device_name">Name <span class="arrow"></span></th>
+          <th class="sortable" data-field="mac">MAC <span class="arrow"></span></th>
+          <th class="sortable" data-field="rssi_dbm">RSSI <span class="arrow"></span></th>
+          <th class="sortable" data-field="last_seen">Last seen <span class="arrow"></span></th>
+          <th class="sortable" data-field="count">Count <span class="arrow"></span></th>
+          <th class="sortable" data-field="label">Label <span class="arrow"></span></th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="device-rows"></tbody>
+    </table>
+    <div class="empty" id="empty-msg" style="display:none">No detections yet.</div>
+  </div>
+</main>
+<script src="/static/vendor/leaflet/leaflet.js"></script>
+<script>
+let devices = [];
+// The mac of the row the user has selected (by clicking it or focusing its
+// label field). While set, live websocket updates stop touching the DOM --
+// they still land in `devices` in the background -- so the list can't move
+// or blow away in-progress input focus/typing out from under the user.
+// Direct user actions (clicking a row/button, bulk actions, reset) always
+// render immediately regardless of this; it only suppresses the *implicit*
+// re-renders triggered by new data arriving.
+let frozenMac = null;
+let hasFitBounds = false;
+// User-chosen sort column/direction, persisted across live updates so the
+// table stops reordering itself out from under the user every poll tick.
+// Defaults to the old "newest first" behavior until they click a header.
+let sortField = 'last_seen';
+let sortDir = 'desc';
+
+const dot = document.getElementById('conn-dot');
+const rowsEl = document.getElementById('device-rows');
+const emptyEl = document.getElementById('empty-msg');
+const captionEl = document.getElementById('map-caption');
+const freezeBannerEl = document.getElementById('freeze-banner');
+const filterNew = document.getElementById('filter-new');
+const showHeatmap = document.getElementById('show-heatmap');
+const searchInput = document.getElementById('search-input');
+
+const map = L.map('map').setView([0, 0], 2);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19,
+  attribution: '&copy; OpenStreetMap contributors',
+}).addTo(map);
+const markerLayer = L.layerGroup().addTo(map);
+const heatLayer = L.layerGroup();
+
+document.getElementById('night-toggle').addEventListener('click', () => {
+  document.documentElement.classList.toggle('night');
+});
+filterNew.addEventListener('change', render);
+showHeatmap.addEventListener('change', () => {
+  if (showHeatmap.checked) heatLayer.addTo(map); else map.removeLayer(heatLayer);
+  render();
+});
+let searchDebounce = null;
+searchInput.addEventListener('input', () => {
+  clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(render, 150);
+});
+
+function relTime(iso) {
+  if (!iso) return '-';
+  const then = new Date(iso.endsWith('Z') || iso.includes('+') ? iso : iso + 'Z');
+  const s = Math.max(0, (Date.now() - then.getTime()) / 1000);
+  if (s < 60) return Math.floor(s) + 's ago';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  return Math.floor(s / 3600) + 'h ago';
+}
+
+async function tagDevice(mac, status, label) {
+  await fetch(`/api/devices/${encodeURIComponent(mac)}/tag`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status, label }),
+  });
+}
+
+function matchesSearch(d, q) {
+  if (!q) return true;
+  q = q.toLowerCase();
+  return (
+    d.mac.toLowerCase().includes(q) ||
+    (d.device_name && d.device_name.toLowerCase().includes(q)) ||
+    (d.label && d.label.toLowerCase().includes(q)) ||
+    (d.vendor_guess && d.vendor_guess.toLowerCase().includes(q))
+  );
+}
+
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function statusColor(status) {
+  return cssVar(status === 'known' ? '--known' : status === 'ignore' ? '--ignore' : '--unknown');
+}
+
+function getVisibleDevices() {
+  const onlyNew = filterNew.checked;
+  const query = searchInput.value.trim();
+  const filtered = devices.filter(d => (!onlyNew || d.status === 'unknown') && matchesSearch(d, query));
+  return sortDevices(filtered);
+}
+
+function compareValues(a, b) {
+  if (a == null && b == null) return 0;
+  if (a == null) return -1;
+  if (b == null) return 1;
+  if (typeof a === 'string') return a.localeCompare(b);
+  return a - b;
+}
+
+function sortDevices(list) {
+  const field = sortField;
+  const dir = sortDir === 'asc' ? 1 : -1;
+  return [...list].sort((a, b) => {
+    let av = a[field];
+    let bv = b[field];
+    if (typeof av === 'string') av = av.toLowerCase();
+    if (typeof bv === 'string') bv = bv.toLowerCase();
+    const cmp = compareValues(av, bv);
+    // Stable tie-break on MAC so equal-value rows (e.g. same status) don't
+    // jitter position between renders as unrelated fields update.
+    return cmp !== 0 ? cmp * dir : compareValues(a.mac, b.mac);
+  });
+}
+
+function setSort(field) {
+  if (sortField === field) {
+    sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    sortField = field;
+    sortDir = 'asc';
+  }
+  render();
+}
+
+for (const th of document.querySelectorAll('th.sortable')) {
+  th.addEventListener('click', () => setSort(th.dataset.field));
+}
+
+function updateSortIndicators() {
+  for (const th of document.querySelectorAll('th.sortable')) {
+    const arrow = th.querySelector('.arrow');
+    arrow.textContent = th.dataset.field === sortField ? (sortDir === 'asc' ? '▲' : '▼') : '';
+  }
+}
+
+async function bulkTag(status) {
+  const visible = getVisibleDevices();
+  if (visible.length === 0) return;
+  if (!confirm(`Mark ${visible.length} currently visible device(s) as "${status}"?`)) return;
+  await fetch('/api/devices/bulk_tag', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ macs: visible.map(d => d.mac), status }),
+  });
+}
+
+document.getElementById('bulk-known').addEventListener('click', () => bulkTag('known'));
+document.getElementById('bulk-ignore').addEventListener('click', () => bulkTag('ignore'));
+
+document.getElementById('reset-db').addEventListener('click', async () => {
+  if (!confirm('This permanently deletes ALL detections and tags. Reset the database?')) return;
+  frozenMac = null;
+  await fetch('/api/reset', { method: 'POST' });
+});
+
+function setFrozen(mac) {
+  frozenMac = mac;
+  freezeBannerEl.style.display = frozenMac ? 'block' : 'none';
+}
+
+function render() {
+  const query = searchInput.value.trim();
+  const visible = getVisibleDevices();
+
+  emptyEl.style.display = devices.length === 0 ? 'block' : 'none';
+  freezeBannerEl.style.display = frozenMac ? 'block' : 'none';
+  updateSortIndicators();
+
+  rowsEl.innerHTML = '';
+  for (const d of visible) {
+    const tr = document.createElement('tr');
+    tr.className = d.status === 'unknown' ? 'row-unknown' : '';
+    if (d.mac === frozenMac) tr.className += ' row-highlight';
+    tr.dataset.mac = d.mac;
+
+    const nameCell = d.device_name || '<span class="muted">(no name)</span>';
+    const vendorBadge = d.vendor_guess
+      ? `<span class="badge vendor ${d.vendor_confidence}" title="Fingerprint guess from BLE advertisement data -- not proof, and a rescuer's own device matches just as well as a missing person's">${d.vendor_guess}?</span>`
+      : '';
+    tr.innerHTML = `
+      <td><span class="badge ${d.status}">${d.status}</span></td>
+      <td>${nameCell} ${vendorBadge}</td>
+      <td class="muted">${d.mac}</td>
+      <td>${d.rssi_dbm ?? '-'}</td>
+      <td>${relTime(d.last_seen)}</td>
+      <td>${d.count}</td>
+      <td><input type="text" value="${d.label ? d.label.replace(/"/g, '&quot;') : ''}" placeholder="label"></td>
+      <td></td>
+    `;
+
+    const labelInput = tr.querySelector('input');
+    // Focusing the field locks the view *without* triggering a render
+    // (a render here would tear down and recreate this very input,
+    // stealing back the focus we're trying to preserve).
+    labelInput.addEventListener('focus', () => setFrozen(d.mac));
+    labelInput.addEventListener('change', () => tagDevice(d.mac, d.status, labelInput.value));
+
+    const actionsCell = tr.querySelector('td:last-child');
+    for (const status of ['known', 'unknown', 'ignore']) {
+      const btn = document.createElement('button');
+      btn.textContent = status;
+      btn.style.marginRight = '4px';
+      btn.style.opacity = d.status === status ? '1' : '0.5';
+      btn.addEventListener('click', () => {
+        tagDevice(d.mac, status, labelInput.value);
+        d.status = status; // optimistic local update, shows immediately even while frozen
+        render();
+      });
+      actionsCell.appendChild(btn);
+    }
+
+    tr.addEventListener('click', (ev) => {
+      if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'BUTTON') return;
+      setFrozen(frozenMac === d.mac ? null : d.mac);
+      render();
+    });
+
+    rowsEl.appendChild(tr);
+  }
+
+  renderMap(visible, query);
+  if (showHeatmap.checked) updateHeatmap(query);
+}
+
+function renderMap(visible, query) {
+  const pts = visible.filter(d => d.lat != null && d.lon != null);
+  markerLayer.clearLayers();
+
+  captionEl.textContent = pts.length
+    ? `${pts.length} positioned device(s)`
+    : 'No GPS-tagged detections match the current view.';
+
+  for (const p of pts) {
+    const marker = L.circleMarker([p.lat, p.lon], {
+      radius: p.mac === frozenMac ? 9 : 6,
+      color: statusColor(p.status),
+      fillColor: statusColor(p.status),
+      fillOpacity: 0.85,
+      weight: p.mac === frozenMac ? 3 : 1,
+    });
+    const vendorLine = p.vendor_guess ? `<br>possible: ${p.vendor_guess} (${p.vendor_confidence})` : '';
+    marker.bindPopup(
+      `<b>${p.device_name || '(no name)'}</b><br>${p.mac}<br>status: ${p.status}<br>rssi: ${p.rssi_dbm ?? '-'} dBm${vendorLine}`
+    );
+    marker.on('click', () => { setFrozen(frozenMac === p.mac ? null : p.mac); render(); });
+    marker.addTo(markerLayer);
+  }
+
+  if (!hasFitBounds && pts.length > 0) {
+    const bounds = L.latLngBounds(pts.map(p => [p.lat, p.lon]));
+    map.fitBounds(bounds, { padding: [30, 30], maxZoom: 17 });
+    hasFitBounds = true;
+  }
+
+  // A search that narrows to exactly one positioned device is almost
+  // certainly "I know this MAC, take me there" -- pan to it without
+  // fighting the initial auto-fit-bounds behavior above.
+  if (query && pts.length === 1) {
+    map.panTo([pts[0].lat, pts[0].lon]);
+  }
+}
+
+async function updateHeatmap(query) {
+  const url = query ? `/api/heatmap?mac=${encodeURIComponent(query)}` : '/api/heatmap';
+  const resp = await fetch(url);
+  const cells = await resp.json();
+  heatLayer.clearLayers();
+  if (cells.length === 0) return;
+  const maxHits = Math.max(...cells.map(c => c.hits));
+  for (const c of cells) {
+    const t = maxHits > 1 ? (c.hits - 1) / (maxHits - 1) : 0;
+    const hue = (1 - t) * 220; // blue (few hits) -> red (many hits)
+    const radius = 6 + Math.min(18, Math.sqrt(c.hits) * 2.5);
+    L.circleMarker([c.lat, c.lon], {
+      radius,
+      stroke: false,
+      fillColor: `hsl(${hue}, 90%, 50%)`,
+      fillOpacity: 0.45,
+    }).bindTooltip(`${c.hits} hit(s)`).addTo(heatLayer);
+  }
+}
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  const ws = new WebSocket(proto + location.host + '/ws');
+  ws.onopen = () => dot.classList.add('connected');
+  ws.onclose = () => { dot.classList.remove('connected'); setTimeout(connect, 2000); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'devices') {
+      devices = msg.devices;
+      if (msg.devices.length === 0) {
+        // Only happens right after a reset -- nothing left to stay frozen on.
+        hasFitBounds = false;
+        setFrozen(null);
+      }
+      if (frozenMac === null) render();
+      // else: state is current in `devices` already; the DOM just isn't
+      // repainted until the user releases the frozen row, so nothing they're
+      // doing (typing a label, etc.) gets disturbed.
+    }
+  };
+}
+
+connect();
+render();
+</script>
+</body>
+</html>

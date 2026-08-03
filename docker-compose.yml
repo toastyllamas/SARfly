@@ -1,0 +1,46 @@
+services:
+  scanner:
+    build: ./services/scanner
+    image: ble-sar-df-scanner:local
+    restart: unless-stopped
+    # Host networking is required so the container can reach the host's
+    # D-Bus system bus (BlueZ) and gpsd's loopback socket without extra
+    # port mappings or a bridge network complicating D-Bus addressing.
+    network_mode: host
+    # BlueZ's D-Bus policy generally only grants adapter control
+    # (discovery, etc.) to root or the "bluetooth" group on the host D-Bus.
+    # Privileged is the simplest way to get that working consistently
+    # across a dev laptop and a Pi; it can be narrowed to specific
+    # capabilities later once the D-Bus policy is tuned.
+    privileged: true
+    volumes:
+      - /var/run/dbus:/var/run/dbus
+      - ./data:/data
+    environment:
+      DB_PATH: /data/detections.sqlite3
+      GPSD_HOST: 127.0.0.1
+      GPSD_PORT: "2947"
+      SOURCE_UNIT_ID: ground-logger-01
+      # The Sena UD100 (CSR8510 chipset) is auto-detected by USB vendor:product
+      # ID (0a12:0001, the app's default) rather than a hardcoded hciN index --
+      # that index isn't stable across reboots/replugs. Set BLE_ADAPTER
+      # explicitly (e.g. "hci0") only to override the auto-detection.
+      # BLE_ADAPTER: hci0
+      LOG_LEVEL: INFO
+
+  ground-station:
+    build: ./services/ground_station
+    image: ble-sar-df-ground-station:local
+    restart: unless-stopped
+    depends_on:
+      - scanner
+    # No host networking or privileges needed here -- this service only
+    # reads/writes the shared SQLite file and serves plain HTTP/WebSocket.
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      DB_PATH: /data/detections.sqlite3
+      POLL_INTERVAL_S: "1.0"
+      LOG_LEVEL: INFO
