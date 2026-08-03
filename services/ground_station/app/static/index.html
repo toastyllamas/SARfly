@@ -107,10 +107,18 @@
     background: transparent; border: 1px solid var(--accent); color: var(--accent);
   }
   .badge.vendor.medium { opacity: 0.65; }
-  input[type=text] {
+  input[type=text], input[type=number] {
     background: var(--panel); border: 1px solid var(--border); color: var(--text);
     border-radius: 4px; padding: 4px 6px; font-size: 12px; width: 130px;
   }
+  input[type=number] { width: 80px; }
+  #mission-panel {
+    margin-top: 10px; padding: 10px; border: 1px solid var(--border); border-radius: 8px;
+  }
+  .mission-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+  .mission-row + .mission-row { margin-top: 8px; }
+  .mission-row label { flex-direction: row; gap: 6px; }
+  #mission-spacing-auto { padding: 2px 8px; font-size: 11px; }
   select {
     background: var(--panel); border: 1px solid var(--border); color: var(--text);
     border-radius: 4px; padding: 4px; font-size: 12px;
@@ -136,6 +144,22 @@
   <div id="map-panel">
     <div id="map"></div>
     <p class="muted" id="map-caption"></p>
+    <div id="mission-panel">
+      <div class="mission-row">
+        <button id="draw-box-btn">Draw search box</button>
+        <button id="clear-box-btn" disabled>Clear</button>
+        <button id="generate-pattern-btn" disabled>Generate search pattern</button>
+      </div>
+      <div class="mission-row">
+        <label>AGL (m) <input type="number" id="mission-agl" value="60" min="1" step="1"></label>
+        <label>Assumed max detection range (m) <input type="number" id="mission-range" value="100" min="1" step="1"></label>
+        <label>Row spacing (m)
+          <input type="number" id="mission-spacing" min="1" step="1">
+          <button id="mission-spacing-auto" type="button" title="Recompute from altitude and detection range">Auto</button>
+        </label>
+      </div>
+      <p class="muted" id="mission-status">Draw a search box on the map to begin.</p>
+    </div>
   </div>
   <div id="table-panel">
     <p class="muted" id="freeze-banner" style="display:none">
@@ -195,6 +219,22 @@ document.addEventListener('selectionchange', () => {
   }
 });
 
+// --- Search grid (lawnmower pattern) planner state ---
+// Detection footprint is modeled as a simple circle from free-space slant
+// range: footprint_radius = sqrt(max_range^2 - agl^2). Row spacing defaults
+// to a fraction of that footprint's diameter so adjacent passes overlap;
+// OVERLAP_FACTOR trades search time against confidence of no gaps. Ignores
+// the drone antenna's own radiation pattern (e.g. a whip's overhead null)
+// -- a reasonable first-order default, not a physically exact model.
+const OVERLAP_FACTOR = 0.8;
+const METERS_PER_DEG_LAT = 111320;
+const MAX_PATTERN_ROWS = 500; // safety cap so a tiny spacing can't hang the tab
+let missionBoxBounds = null;
+let missionBoxLayer = null;
+let drawingBox = false;
+let drawStart = null;
+let spacingManuallySet = false;
+
 const dot = document.getElementById('conn-dot');
 const rowsEl = document.getElementById('device-rows');
 const emptyEl = document.getElementById('empty-msg');
@@ -203,6 +243,14 @@ const freezeBannerEl = document.getElementById('freeze-banner');
 const filterNew = document.getElementById('filter-new');
 const showHeatmap = document.getElementById('show-heatmap');
 const searchInput = document.getElementById('search-input');
+const drawBoxBtn = document.getElementById('draw-box-btn');
+const clearBoxBtn = document.getElementById('clear-box-btn');
+const generateBtn = document.getElementById('generate-pattern-btn');
+const aglInput = document.getElementById('mission-agl');
+const rangeInput = document.getElementById('mission-range');
+const spacingInput = document.getElementById('mission-spacing');
+const spacingAutoBtn = document.getElementById('mission-spacing-auto');
+const missionStatusEl = document.getElementById('mission-status');
 
 const map = L.map('map').setView([0, 0], 2);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -211,6 +259,7 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 }).addTo(map);
 const markerLayer = L.layerGroup().addTo(map);
 const heatLayer = L.layerGroup();
+const missionPatternLayer = L.layerGroup().addTo(map);
 
 document.getElementById('night-toggle').addEventListener('click', () => {
   document.documentElement.classList.toggle('night');
@@ -457,6 +506,229 @@ async function updateHeatmap(query) {
     }).bindTooltip(`${c.hits} hit(s)`).addTo(heatLayer);
   }
 }
+
+function metersPerDegLon(latDeg) {
+  return METERS_PER_DEG_LAT * Math.cos(latDeg * Math.PI / 180);
+}
+
+function footprintRadius(aglM, rangeM) {
+  const diffSq = rangeM * rangeM - aglM * aglM;
+  return diffSq > 0 ? Math.sqrt(diffSq) : 0;
+}
+
+function computeDefaultSpacing(aglM, rangeM) {
+  return 2 * OVERLAP_FACTOR * footprintRadius(aglM, rangeM);
+}
+
+function boxSizeMeters(bounds) {
+  const sw = bounds.getSouthWest();
+  const ne = bounds.getNorthEast();
+  const centerLat = (sw.lat + ne.lat) / 2;
+  return {
+    widthM: Math.abs(ne.lng - sw.lng) * metersPerDegLon(centerLat),
+    heightM: Math.abs(ne.lat - sw.lat) * METERS_PER_DEG_LAT,
+  };
+}
+
+// Boustrophedon ("lawnmower") coverage path for an axis-aligned box. Rows
+// run along the box's longer edge (fewer, longer passes) and are spaced
+// across the shorter edge; a quadcopter can reverse in place at each row
+// end, so unlike fixed-wing survey planning there's no minimum turn radius
+// to account for. Returns [[lat, lon], ...] in flight order, or null if
+// spacing is too small for the box and would blow past MAX_PATTERN_ROWS.
+function generateLawnmowerPattern(bounds, spacingM) {
+  const sw = bounds.getSouthWest();
+  const ne = bounds.getNorthEast();
+  const south = sw.lat, north = ne.lat, west = sw.lng, east = ne.lng;
+  const centerLat = (south + north) / 2;
+  const { widthM, heightM } = boxSizeMeters(bounds);
+
+  const waypoints = [];
+  if (widthM >= heightM) {
+    const stepDeg = spacingM / METERS_PER_DEG_LAT;
+    const rows = [];
+    for (let lat = south; lat < north && rows.length < MAX_PATTERN_ROWS; lat += stepDeg) rows.push(lat);
+    if (rows.length >= MAX_PATTERN_ROWS) return null;
+    if (rows.length === 0 || rows[rows.length - 1] < north) rows.push(north);
+    rows.forEach((rowLat, idx) => {
+      const pair = idx % 2 === 0 ? [west, east] : [east, west];
+      waypoints.push([rowLat, pair[0]], [rowLat, pair[1]]);
+    });
+  } else {
+    const stepDeg = spacingM / metersPerDegLon(centerLat);
+    const cols = [];
+    for (let lon = west; lon < east && cols.length < MAX_PATTERN_ROWS; lon += stepDeg) cols.push(lon);
+    if (cols.length >= MAX_PATTERN_ROWS) return null;
+    if (cols.length === 0 || cols[cols.length - 1] < east) cols.push(east);
+    cols.forEach((colLon, idx) => {
+      const pair = idx % 2 === 0 ? [south, north] : [north, south];
+      waypoints.push([pair[0], colLon], [pair[1], colLon]);
+    });
+  }
+  return waypoints;
+}
+
+function haversineMeters([lat1, lon1], [lat2, lon2]) {
+  const R = 6371000;
+  const toRad = (d) => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+function trackLengthMeters(waypoints) {
+  let total = 0;
+  for (let i = 1; i < waypoints.length; i++) total += haversineMeters(waypoints[i - 1], waypoints[i]);
+  return total;
+}
+
+function drawPattern(waypoints) {
+  missionPatternLayer.clearLayers();
+  if (!waypoints || waypoints.length === 0) return;
+  L.polyline(waypoints, { color: cssVar('--accent'), weight: 3, dashArray: '6 4' }).addTo(missionPatternLayer);
+  L.circleMarker(waypoints[0], {
+    radius: 5, color: cssVar('--known'), fillColor: cssVar('--known'), fillOpacity: 1,
+  }).bindTooltip('Start').addTo(missionPatternLayer);
+  L.circleMarker(waypoints[waypoints.length - 1], {
+    radius: 5, color: cssVar('--unknown'), fillColor: cssVar('--unknown'), fillOpacity: 1,
+  }).bindTooltip('End / RTL').addTo(missionPatternLayer);
+}
+
+function updateMissionStatus(waypoints) {
+  if (!missionBoxBounds) {
+    missionStatusEl.textContent = 'Draw a search box on the map to begin.';
+    return;
+  }
+  const agl = parseFloat(aglInput.value) || 0;
+  const range = parseFloat(rangeInput.value) || 0;
+  if (agl >= range) {
+    missionStatusEl.textContent =
+      `Warning: ${agl}m AGL is at or beyond the assumed ${range}m detection range -- you likely won't detect anything at this altitude.`;
+    return;
+  }
+  if (!waypoints) {
+    missionStatusEl.textContent = 'Box ready -- click "Generate search pattern".';
+    return;
+  }
+  if (waypoints === 'too-many-rows') {
+    missionStatusEl.textContent = 'Row spacing is too small for this box -- increase spacing or shrink the box.';
+    return;
+  }
+  const rows = Math.round(waypoints.length / 2);
+  const lengthKm = (trackLengthMeters(waypoints) / 1000).toFixed(2);
+  missionStatusEl.textContent = `${rows} row(s), ${waypoints.length} waypoints, ~${lengthKm} km track length.`;
+}
+
+function recomputeAutoSpacing() {
+  if (spacingManuallySet) return;
+  const agl = parseFloat(aglInput.value) || 0;
+  const range = parseFloat(rangeInput.value) || 0;
+  const computed = computeDefaultSpacing(agl, range);
+  spacingInput.value = computed > 0 ? Math.round(computed) : '';
+}
+
+function onMissionParamsChanged() {
+  missionPatternLayer.clearLayers();
+  updateMissionStatus();
+}
+
+aglInput.addEventListener('input', () => {
+  recomputeAutoSpacing();
+  onMissionParamsChanged();
+});
+rangeInput.addEventListener('input', () => {
+  recomputeAutoSpacing();
+  onMissionParamsChanged();
+});
+spacingInput.addEventListener('input', () => {
+  spacingManuallySet = true;
+  onMissionParamsChanged();
+});
+spacingAutoBtn.addEventListener('click', () => {
+  spacingManuallySet = false;
+  recomputeAutoSpacing();
+  onMissionParamsChanged();
+});
+
+drawBoxBtn.addEventListener('click', () => {
+  if (drawingBox) {
+    drawingBox = false;
+    drawStart = null;
+    map.dragging.enable();
+    map.getContainer().style.cursor = '';
+    drawBoxBtn.textContent = missionBoxBounds ? 'Redraw search box' : 'Draw search box';
+    updateMissionStatus();
+    return;
+  }
+  drawingBox = true;
+  drawStart = null;
+  drawBoxBtn.textContent = 'Cancel drawing';
+  map.dragging.disable();
+  map.getContainer().style.cursor = 'crosshair';
+  missionStatusEl.textContent = 'Click and drag on the map to draw the search box.';
+});
+
+clearBoxBtn.addEventListener('click', () => {
+  if (missionBoxLayer) { map.removeLayer(missionBoxLayer); missionBoxLayer = null; }
+  missionBoxBounds = null;
+  missionPatternLayer.clearLayers();
+  generateBtn.disabled = true;
+  clearBoxBtn.disabled = true;
+  drawBoxBtn.textContent = 'Draw search box';
+  updateMissionStatus();
+});
+
+generateBtn.addEventListener('click', () => {
+  if (!missionBoxBounds) return;
+  const spacing = parseFloat(spacingInput.value);
+  if (!(spacing > 0)) {
+    missionStatusEl.textContent = 'Row spacing must be greater than 0.';
+    return;
+  }
+  const waypoints = generateLawnmowerPattern(missionBoxBounds, spacing);
+  if (waypoints === null) {
+    missionPatternLayer.clearLayers();
+    updateMissionStatus('too-many-rows');
+    return;
+  }
+  drawPattern(waypoints);
+  updateMissionStatus(waypoints);
+});
+
+map.on('mousedown', (e) => {
+  if (!drawingBox) return;
+  drawStart = e.latlng;
+  if (missionBoxLayer) { map.removeLayer(missionBoxLayer); missionBoxLayer = null; }
+  missionBoxLayer = L.rectangle(L.latLngBounds(drawStart, drawStart), {
+    color: cssVar('--accent'), weight: 2, fillOpacity: 0.08,
+  }).addTo(map);
+});
+
+map.on('mousemove', (e) => {
+  if (!drawingBox || !drawStart) return;
+  missionBoxLayer.setBounds(L.latLngBounds(drawStart, e.latlng));
+});
+
+map.on('mouseup', (e) => {
+  if (!drawingBox || !drawStart) return;
+  const bounds = L.latLngBounds(drawStart, e.latlng);
+  const { widthM, heightM } = boxSizeMeters(bounds);
+  drawStart = null;
+  if (widthM < 5 || heightM < 5) return; // too small to be a real drag -- keep drawing
+  missionBoxLayer.setBounds(bounds);
+  missionBoxBounds = bounds;
+  drawingBox = false;
+  map.dragging.enable();
+  map.getContainer().style.cursor = '';
+  drawBoxBtn.textContent = 'Redraw search box';
+  clearBoxBtn.disabled = false;
+  generateBtn.disabled = false;
+  missionPatternLayer.clearLayers();
+  updateMissionStatus();
+});
+
+recomputeAutoSpacing();
 
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
