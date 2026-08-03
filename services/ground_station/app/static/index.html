@@ -139,7 +139,7 @@
   </div>
   <div id="table-panel">
     <p class="muted" id="freeze-banner" style="display:none">
-      Selection locked so you can edit without the list moving — click the row again to release it.
+      Editing this device's label — live updates are paused so your typing isn't disturbed.
     </p>
     <table>
       <thead>
@@ -162,13 +162,13 @@
 <script src="/static/vendor/leaflet/leaflet.js"></script>
 <script>
 let devices = [];
-// The mac of the row the user has selected (by clicking it or focusing its
-// label field). While set, live websocket updates stop touching the DOM --
-// they still land in `devices` in the background -- so the list can't move
-// or blow away in-progress input focus/typing out from under the user.
-// Direct user actions (clicking a row/button, bulk actions, reset) always
-// render immediately regardless of this; it only suppresses the *implicit*
-// re-renders triggered by new data arriving.
+// The mac of the row whose label field currently has focus. While set, live
+// websocket updates stop touching the DOM -- they still land in `devices`
+// in the background -- so an in-progress edit doesn't get its focus/typing
+// stolen by a re-render. Automatically released on blur. Rows are no longer
+// freezable by clicking them: sorting now keeps row order stable on its
+// own, and a click handler there would blow away in-progress text
+// selection when copying a MAC/name out of the table.
 let frozenMac = null;
 let hasFitBounds = false;
 // User-chosen sort column/direction, persisted across live updates so the
@@ -176,6 +176,24 @@ let hasFitBounds = false;
 // Defaults to the old "newest first" behavior until they click a header.
 let sortField = 'last_seen';
 let sortDir = 'desc';
+// Set when a live update arrives while the user has text selected inside
+// the table (e.g. mid drag-select to copy a MAC/name) so the rebuild that
+// would otherwise wipe the selection is deferred until it clears -- no
+// click/freeze needed, this is purely a "don't yank text out from under an
+// active selection" guard.
+let pendingRender = false;
+
+function hasTableSelection() {
+  const sel = window.getSelection();
+  return !!sel && !sel.isCollapsed && rowsEl.contains(sel.anchorNode);
+}
+
+document.addEventListener('selectionchange', () => {
+  if (pendingRender && !hasTableSelection()) {
+    pendingRender = false;
+    render();
+  }
+});
 
 const dot = document.getElementById('conn-dot');
 const rowsEl = document.getElementById('device-rows');
@@ -353,8 +371,13 @@ function render() {
     const labelInput = tr.querySelector('input');
     // Focusing the field locks the view *without* triggering a render
     // (a render here would tear down and recreate this very input,
-    // stealing back the focus we're trying to preserve).
+    // stealing back the focus we're trying to preserve). Blur releases the
+    // lock automatically -- rows no longer need a manual click to
+    // freeze/unfreeze now that sorting keeps row order stable, and a click
+    // handler here would blow away in-progress text selection when copying
+    // a MAC/name out of the table.
     labelInput.addEventListener('focus', () => setFrozen(d.mac));
+    labelInput.addEventListener('blur', () => setFrozen(null));
     labelInput.addEventListener('change', () => tagDevice(d.mac, d.status, labelInput.value));
 
     const actionsCell = tr.querySelector('td:last-child');
@@ -370,12 +393,6 @@ function render() {
       });
       actionsCell.appendChild(btn);
     }
-
-    tr.addEventListener('click', (ev) => {
-      if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'BUTTON') return;
-      setFrozen(frozenMac === d.mac ? null : d.mac);
-      render();
-    });
 
     rowsEl.appendChild(tr);
   }
@@ -404,7 +421,6 @@ function renderMap(visible, query) {
     marker.bindPopup(
       `<b>${p.device_name || '(no name)'}</b><br>${p.mac}<br>status: ${p.status}<br>rssi: ${p.rssi_dbm ?? '-'} dBm${vendorLine}`
     );
-    marker.on('click', () => { setFrozen(frozenMac === p.mac ? null : p.mac); render(); });
     marker.addTo(markerLayer);
   }
 
@@ -457,10 +473,15 @@ function connect() {
         hasFitBounds = false;
         setFrozen(null);
       }
-      if (frozenMac === null) render();
-      // else: state is current in `devices` already; the DOM just isn't
-      // repainted until the user releases the frozen row, so nothing they're
-      // doing (typing a label, etc.) gets disturbed.
+      if (frozenMac !== null) {
+        // state is current in `devices` already; the DOM just isn't
+        // repainted until the label field blurs, so in-progress typing
+        // doesn't get disturbed.
+      } else if (hasTableSelection()) {
+        pendingRender = true;
+      } else {
+        render();
+      }
     }
   };
 }
