@@ -1,26 +1,35 @@
 # BLE SAR Direction-Finding Tool
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full system design.
+Passive BLE direction-finding for search and rescue: log GPS-tagged
+Bluetooth Low Energy detections from a ground unit or a drone-mounted
+sweep, cluster them into candidate leads on a live map, and hand a
+narrowed search area off to the ground team — all receive-only, no
+transmit license or Part 15 concern. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full phased system
+design (baseline → wide-area sweep → cueing → close-in DF → confirmation).
 
-Three services, meant to run unattended (e.g. on a field SBC at boot, no
-user interaction):
+## Supported hardware
 
-- **scanner** (Phase 0/A ground logger): continuously scans for BLE
-  advertisements via a Sena UD100 (or any BlueZ-recognized adapter) and logs
-  each detection with a GPS-tagged timestamp to a local SQLite file.
-  Validated end-to-end on a Sena UD100 + USB GPS.
-- **scanner-ubertooth**: a second, independent advertisement-scanning unit
-  backed by an Ubertooth One instead of the UD100, writing into the same
-  detections log. Starts unconditionally alongside `scanner` — if no
-  Ubertooth is attached, it just idles retrying every 5s rather than
-  blocking anything else, so the same `docker compose up` works whether one,
-  both, or neither adapter is present. Validated end-to-end against real
-  hardware, including both scanners writing concurrently to the shared
-  database.
-- **ground-station**: a live web UI for tagging devices you already know
-  about (so new/unknown ones stand out), a real-time map, and on-demand KMZ
-  export for handoff to Google Earth/ATAK. Shows detections from both
-  scanners together, distinguishable by `source_unit_id`.
+| Role | Hardware | Status |
+|---|---|---|
+| Primary BLE scanner | Sena UD100, or any BlueZ-recognized adapter | Validated end-to-end |
+| Secondary BLE scanner | Ubertooth One | Validated end-to-end, including independent CRC-24 verification (see [Ubertooth notes](#ubertooth-notes)) |
+| GPS | Any NMEA-capable USB/serial module, via gpsd | Validated end-to-end |
+
+The two scanners are independent and additive, not either/or: run one, the
+other, or both at once, and every detection lands in the same shared log
+regardless of which radio saw it. Neither is required to be physically
+present for the stack to start — see [Running](#running).
+
+## Contents
+
+- [Host prerequisites](#host-prerequisites)
+- [Running](#running)
+- [Ground-station UI](#ground-station-ui)
+- [Configuration](#configuration)
+- [Ubertooth notes](#ubertooth-notes)
+- [Raspberry Pi deployment](#raspberry-pi-deployment)
+- [Known limitations / not yet built](#known-limitations--not-yet-built)
 
 ## Host prerequisites
 
@@ -33,19 +42,19 @@ dev laptop and on the Raspberry Pi target.
 1. **Bluetooth adapter — Sena UD100**
    Plug it in. It uses the in-kernel `btusb` driver; no vendor driver needed
    on Linux. Confirm it's recognized:
-   ```
-   lsusb | grep -i sena      # or: look for a CSR8510-based Class 1 adapter
-   hciconfig -a               # should list the new hciX interface
+   ```bash
+   lsusb | grep -i sena       # or: look for a CSR8510-based Class 1 adapter
+   hciconfig -a                # should list the new hciX interface
    ```
    Make sure `bluetoothd` (BlueZ) is installed and running:
-   ```
+   ```bash
    systemctl status bluetooth
    ```
 
 2. **GPS — via gpsd**
    Any NMEA-capable USB/serial GPS module works; gpsd abstracts the specific
    hardware away from the app.
-   ```
+   ```bash
    sudo pacman -S gpsd            # or: apt install gpsd gpsd-clients
    sudo sed -i 's|^DEVICES=.*|DEVICES="/dev/ttyUSB0"|' /etc/default/gpsd   # adjust device path
    sudo systemctl enable --now gpsd.socket gpsd.service
@@ -63,38 +72,39 @@ dev laptop and on the Raspberry Pi target.
    your user in the `docker` group (`sudo usermod -aG docker $USER`, then
    re-login).
 
-4. **Ubertooth One (optional)** — `scanner-ubertooth` starts either way (see
-   Configuration below), so this step is only needed if you actually want it
-   capturing. Just plug it in; confirm with `lsusb | grep -i ubertooth`
-   (vendor:product `1d50:6002`). Unlike the Sena UD100, it doesn't need
-   BlueZ, udev rules, or any host-side driver setup for the Docker path —
-   `scanner-ubertooth` runs `privileged: true`, which gives the container raw
-   USB access directly, and the Ubertooth host tools are built into that
-   container's image. (Host udev rules only matter if you want to run
-   `ubertooth-btle` directly on the host outside Docker, e.g. for ad-hoc
-   testing.)
+4. **Ubertooth One (optional)** — plug it in; confirm with
+   `lsusb | grep -i ubertooth` (vendor:product `1d50:6002`). Unlike the
+   UD100, it needs no BlueZ/udev/host-side driver setup at all for the
+   Docker path: `scanner-ubertooth` runs `privileged: true` for raw USB
+   access, and its host tools are built into that container's own image.
+   (Host udev rules only matter for running `ubertooth-btle` directly on the
+   host, outside Docker — e.g. ad-hoc testing.)
 
 ## Running
 
-```
+```bash
 cd ble-sar-df
 docker compose up --build
 ```
 
-This starts all three services regardless of which adapters are physically
-present — `scanner` and `scanner-ubertooth` each independently no-op/retry
-if their adapter is missing (see Configuration below), so the same command
-works unattended on an SBC that might have the UD100, the Ubertooth, both,
-or (temporarily) neither.
+This always starts all three services, regardless of which adapters are
+physically present — `scanner` and `scanner-ubertooth` each retry quietly
+in the background rather than blocking anything if their radio is missing
+(see [Known limitations](#known-limitations--not-yet-built)). One command
+works unattended whether the host has the UD100, the Ubertooth, both, or
+neither yet — the point of that design is a field SBC that boots this stack
+with no one there to pass a flag.
 
 Detections accumulate in `./data/detections.sqlite3` on the host (bind-mounted,
 so the log survives container restarts/rebuilds). Inspect with:
 
-```
+```bash
 sqlite3 data/detections.sqlite3 'select * from detections order by id desc limit 20;'
 ```
 
-Open **http://localhost:8080** for the ground-station UI:
+Open **http://localhost:8080** for the ground-station UI.
+
+## Ground-station UI
 
 - A live table of every device seen, sorted by most recent activity. New/
   unknown devices are highlighted; tag each as **known** (e.g. rescuer
@@ -172,19 +182,6 @@ Environment variables (set in `docker-compose.yml`):
 
 **scanner-ubertooth**
 
-An independent second capture unit for an Ubertooth One, run alongside the
-primary scanner rather than instead of it. Starts unconditionally with
-`docker compose up`; if no Ubertooth is attached it just retries every 5s
-without crashing (see "Known limitations" for the same behavior on the
-primary `scanner` if the UD100 is missing). Ubertooth doesn't implement HCI
-and BlueZ can't drive it as an adapter, so this doesn't go through
-`BLE_ADAPTER`/bleak at all — it's a separate entrypoint
-(`main_ubertooth.py`) that runs `ubertooth-btle -n` directly and parses its
-output into the same detection schema, writing into the same shared
-`detections.sqlite3`. Advertisement-only for now (matches what the primary
-scanner does); BLE connection-following is a separate, not-yet-built
-capability.
-
 | Var | Default | Meaning |
 |---|---|---|
 | `DB_PATH` | `/data/detections.sqlite3` | Same SQLite file as the primary scanner (shared via the `./data` volume) |
@@ -199,6 +196,31 @@ capability.
 | `DB_PATH` | `/data/detections.sqlite3` | Same SQLite file as the scanner (shared via the `./data` volume) |
 | `POLL_INTERVAL_S` | `1.0` | How often to check for new detections and broadcast updates over the WebSocket |
 | `GRID_PRECISION` | `4` | Decimal places used to bin lat/lon for the heatmap (4 ≈ 11m cells; lower = coarser/faster, higher = finer-grained) |
+
+## Ubertooth notes
+
+`scanner-ubertooth` is a genuinely separate capture path, not the UD100
+scanner pointed at different hardware — Ubertooth doesn't implement HCI and
+never shows up under `/sys/class/bluetooth`, so BlueZ/`bleak` has no way to
+drive it as an adapter. Instead it's its own entrypoint
+(`main_ubertooth.py`) that runs `ubertooth-btle -n` as a subprocess, parses
+its text output, and writes into the same detection schema the primary
+scanner uses. Advertisement-only for now, matching what the UD100 path
+does; BLE connection-following (catching a device that's paired to a phone
+and no longer advertising) is a separate, not-yet-built capability — see
+Component E in `docs/ARCHITECTURE.md`.
+
+One non-obvious fix worth knowing about if you're reading the source:
+`ubertooth-btle`'s own `(valid)`/`(invalid)` tag on decoded packets does
+**not** mean the CRC checked out — it only reflects whether the access
+address matched (confirmed against `libbtbb`'s source), and nothing in this
+capture path verifies CRC-24 by itself. Left unchecked, that showed up as
+device names with single/few corrupted bytes (a real device seen during
+testing: `WHOOP 5AG0085293` intermittently coming through as
+`WH_OP 1AG0085293` and similar). `ble_crc.py` ports the real CRC-24
+generator from the Ubertooth firmware source and `ubertooth_source.py` uses
+it as the actual validity gate, verified against the packet's raw on-air
+bytes rather than the tool's own flag.
 
 ## Raspberry Pi deployment
 
@@ -219,16 +241,16 @@ compose change).
 - No device-track history on the map yet — it only plots each device's
   latest position, not its path over time. The heatmap shows historical
   density but not direction of travel.
-- `privileged: true` on the scanner is broader than strictly necessary; it
-  can be narrowed once the host's D-Bus BlueZ policy is tuned for the
-  specific caps needed. The ground-station service does not need it.
+- `privileged: true` on both scanners is broader than strictly necessary; it
+  can be narrowed once the host's D-Bus BlueZ policy is tuned (for
+  `scanner`) and the exact USB caps are pinned down (for
+  `scanner-ubertooth`). The ground-station service needs neither.
 - Not yet deployed/tested on a Raspberry Pi — validated so far on an x86_64
   dev laptop only.
-- `scanner` and `scanner-ubertooth` both retry (every 5s) rather than exit
-  if their adapter is missing at startup or disappears later, so
-  `docker compose up` is safe to run unattended (e.g. at SBC boot) whether
-  one, both, or neither adapter is physically present yet. Neither one
-  currently distinguishes "adapter missing" from other startup failures in
-  its retry log line, so if scanning silently never starts, check the
-  container logs for what the underlying error actually is rather than
-  assuming it's just a missing adapter.
+- `scanner` and `scanner-ubertooth` both retry every 5s rather than exit if
+  their adapter is missing or disappears mid-run, which is what makes
+  unattended boot safe (see [Running](#running)) — but neither currently
+  distinguishes "adapter missing" from other startup failures in its retry
+  log line, so if scanning silently never starts, check the container logs
+  for what the underlying error actually is rather than assuming it's just
+  a missing adapter.
