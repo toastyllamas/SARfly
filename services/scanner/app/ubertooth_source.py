@@ -11,6 +11,17 @@ Output is one record per received packet. A new record always starts with a
 belongs to it. This is more robust than splitting on blank lines, since a
 single record can contain internal blank lines between its nested AD-type
 breakdown and its trailing Data:/CRC: lines.
+
+The "(valid)"/"(invalid)" tag on ubertooth-btle's "Advertising / AA ..."
+line is *not* a CRC check -- it only reflects whether the access-address bit
+pattern matched (confirmed against libbtbb's source: `access_address_ok`,
+nothing else). Nothing in this capture path verifies CRC-24 on its own
+(`-v1` doesn't affect it either), so bit-corrupted payloads -- garbled
+device names, corrupted manufacturer data -- pass through it unfiltered.
+ble_crc.py ports the real CRC-24 algorithm from the Ubertooth firmware
+source and is used below as the actual validity gate, against the packet's
+raw on-air bytes (the unlabeled hex dump line ubertooth-btle prints ahead of
+its own decode).
 """
 
 from __future__ import annotations
@@ -22,13 +33,14 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from ble_ad_parser import parse_ad_structure
+from ble_crc import crc_ok
 
 logger = logging.getLogger(__name__)
 
 _HEADER_RE = re.compile(
     r"^systime=\d+ freq=\d+ addr=[0-9a-f]+ delta_t=[\d.]+ ms rssi=(-?\d+)"
 )
-_VALIDITY_RE = re.compile(r"^Advertising / AA [0-9a-f]+ \((valid|invalid)\)")
+_RAWHEX_RE = re.compile(r"^([0-9a-f]{2} )+[0-9a-f]{2}\s*$")
 _ADVA_RE = re.compile(r"^\s*AdvA:\s+([0-9a-f:]+) \((public|random)\)")
 _ADVDATA_RE = re.compile(r"^\s*AdvData:\s+([0-9a-f ]+?)\s*$")
 
@@ -46,24 +58,28 @@ class ParsedAdvertisement:
 
 def _parse_record(lines: list[str]) -> ParsedAdvertisement | None:
     rssi: int | None = None
-    valid: bool | None = None
+    raw_hex: str | None = None
     mac: str | None = None
     adv_data_hex: str | None = None
 
     for line in lines:
         if (m := _HEADER_RE.match(line)) is not None:
             rssi = int(m.group(1))
-        elif (m := _VALIDITY_RE.match(line)) is not None:
-            valid = m.group(1) == "valid"
+        elif raw_hex is None and _RAWHEX_RE.match(line):
+            raw_hex = line.strip()
         elif (m := _ADVA_RE.match(line)) is not None:
             mac = m.group(1)
         elif (m := _ADVDATA_RE.match(line)) is not None:
             adv_data_hex = m.group(1)
 
-    # Noise passing the correlator's CRC check by chance is common in
-    # promiscuous-style capture (see bench notes); only valid-CRC packets
-    # with an advertiser address are worth logging as a detection.
-    if not valid or rssi is None or mac is None:
+    if rssi is None or mac is None or raw_hex is None:
+        return None
+
+    # The real validity gate -- see module docstring for why the tool's own
+    # "(valid)" tag isn't this. raw_hex is [2-byte PDU header][6-byte
+    # AdvA][AdvData][3-byte CRC] exactly as transmitted.
+    raw = bytes.fromhex(raw_hex.replace(" ", ""))
+    if len(raw) < 3 or not crc_ok(raw[:-3], raw[-3:]):
         return None
 
     ad = parse_ad_structure(adv_data_hex) if adv_data_hex else None
