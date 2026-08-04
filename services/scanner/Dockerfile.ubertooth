@@ -1,0 +1,41 @@
+FROM debian:trixie-slim AS build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git pkg-config ca-certificates \
+        libusb-1.0-0-dev libbluetooth-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# Debian packages a 2018.12 ubertooth/libbtbb build; build current upstream
+# instead so host tools match the device firmware (validated against
+# 2020-12-R1/API 1.07 on the dev laptop) rather than risking an API mismatch.
+RUN git clone --depth 1 https://github.com/greatscottgadgets/libbtbb.git && \
+    cmake -S libbtbb -B libbtbb/build \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DENABLE_PYTHON=OFF && \
+    cmake --build libbtbb/build -j"$(nproc)" && \
+    cmake --install libbtbb/build && ldconfig
+
+RUN git clone --depth 1 https://github.com/greatscottgadgets/ubertooth.git && \
+    cmake -S ubertooth/host -B ubertooth/host/build \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DENABLE_PYTHON=OFF && \
+    cmake --build ubertooth/host/build -j"$(nproc)" && \
+    cmake --install ubertooth/host/build
+
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libusb-1.0-0 libbluetooth3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /usr/local/lib/libbtbb* /usr/local/lib/
+COPY --from=build /usr/local/lib/libubertooth* /usr/local/lib/
+COPY --from=build /usr/local/bin/ubertooth-btle /usr/local/bin/ubertooth-util /usr/local/bin/
+RUN ldconfig
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app/ .
+
+ENTRYPOINT ["python", "main_ubertooth.py"]

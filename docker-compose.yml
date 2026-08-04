@@ -28,6 +28,38 @@ services:
       # BLE_ADAPTER: hci0
       LOG_LEVEL: INFO
 
+  # Second, independent BLE capture unit -- an Ubertooth One instead of the
+  # Sena UD100. Starts unconditionally alongside the primary scanner (no
+  # profile gate) so an unattended boot on the field SBC doesn't need anyone
+  # to pass a flag. If the Ubertooth isn't physically attached, ubertooth-btle
+  # fails to open it, ubertooth_source.py logs a warning and retries every 5s
+  # forever -- the container stays up and harmless, it just idles until the
+  # device appears (or never, if this deployment doesn't have one). Writes
+  # into the same shared detections.sqlite3, tagged with its own
+  # SOURCE_UNIT_ID, so it shows up in the ground-station UI like any other
+  # unit's detections.
+  scanner-ubertooth:
+    build:
+      context: ./services/scanner
+      dockerfile: Dockerfile.ubertooth
+    image: ble-sar-df-scanner-ubertooth:local
+    restart: unless-stopped
+    # No BlueZ/D-Bus involved here (see ubertooth_source.py), but still
+    # needs host networking to reach gpsd, and privileged for raw USB access
+    # to the Ubertooth without per-device udev/cgroup wiring in compose.
+    network_mode: host
+    privileged: true
+    volumes:
+      - ./data:/data
+    environment:
+      DB_PATH: /data/detections.sqlite3
+      GPSD_HOST: 127.0.0.1
+      GPSD_PORT: "2947"
+      SOURCE_UNIT_ID: ground-logger-ubertooth-01
+      # Only needed with more than one Ubertooth on the same host.
+      # UBERTOOTH_DEVICE_INDEX: "0"
+      LOG_LEVEL: INFO
+
   ground-station:
     build: ./services/ground_station
     image: ble-sar-df-ground-station:local

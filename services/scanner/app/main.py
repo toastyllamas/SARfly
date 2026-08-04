@@ -105,24 +105,36 @@ async def run() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
 
-    adapter = BLE_ADAPTER or find_adapter_by_usb_id(
-        BLE_ADAPTER_USB_VID, BLE_ADAPTER_USB_PID
-    )
-    scanner_kwargs = {"detection_callback": make_detection_handler(storage, gps)}
-    if adapter:
-        logger.info("using BLE adapter %s", adapter)
-        scanner_kwargs["bluez"] = {"adapter": adapter}
-    else:
-        logger.warning(
-            "could not resolve adapter by USB id %s:%s; falling back to bleak's default adapter",
-            BLE_ADAPTER_USB_VID,
-            BLE_ADAPTER_USB_PID,
+    # Retries on any failure to start scanning (e.g. the UD100 is unplugged
+    # and BlueZ has no adapter at all, not just the wrong one) rather than
+    # letting the process crash and depending on Docker's restart policy --
+    # same reconnect-without-crashing philosophy as GpsClient.run() and
+    # ubertooth_source.stream_advertisements(), so an unattended boot on the
+    # field SBC self-heals the same way regardless of which adapter is
+    # missing.
+    while not stop_event.is_set():
+        adapter = BLE_ADAPTER or find_adapter_by_usb_id(
+            BLE_ADAPTER_USB_VID, BLE_ADAPTER_USB_PID
         )
+        scanner_kwargs = {"detection_callback": make_detection_handler(storage, gps)}
+        if adapter:
+            logger.info("using BLE adapter %s", adapter)
+            scanner_kwargs["bluez"] = {"adapter": adapter}
+        else:
+            logger.warning(
+                "could not resolve adapter by USB id %s:%s; falling back to bleak's default adapter",
+                BLE_ADAPTER_USB_VID,
+                BLE_ADAPTER_USB_PID,
+            )
 
-    scanner = BleakScanner(**scanner_kwargs)
-    async with scanner:
-        logger.info("scanning...")
-        await stop_event.wait()
+        try:
+            scanner = BleakScanner(**scanner_kwargs)
+            async with scanner:
+                logger.info("scanning...")
+                await stop_event.wait()
+        except Exception:
+            logger.exception("BLE scan failed (adapter missing/unavailable?); retrying in 5s")
+            await asyncio.sleep(5)
 
     logger.info("shutting down")
     gps_task.cancel()
