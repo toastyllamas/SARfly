@@ -224,7 +224,20 @@ async def _run_hackrf_sweep(low_hz: int, high_hz: int, duration_s: float) -> lis
         exited_returncode = proc.returncode
         if proc.returncode is None:
             proc.terminate()
-            await proc.wait()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                # SIGTERM went unanswered -- e.g. the process is wedged in a
+                # libusb call after a USB reset/glitch. An unbounded wait()
+                # here would hang this coroutine (and therefore the whole
+                # scanner, since _sweep_band's retry-forever loop depends on
+                # this function returning) exactly like the early-exit bug
+                # this file's Fix 2 eliminated, just triggered by a stuck
+                # process instead of a fast one. SIGKILL is not ignorable by
+                # a normal process, so this second wait() is expected to
+                # return promptly.
+                proc.kill()
+                await proc.wait()
 
     if not timed_out or exited_returncode not in (None, 0):
         stderr_context = " | ".join(stderr_lines) or "(no stderr output captured)"

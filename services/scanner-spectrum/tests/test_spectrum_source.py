@@ -256,6 +256,52 @@ def test_sweep_band_retries_on_early_exit(fake_hackrf_sweep_device_gone, monkeyp
     assert sleep_calls == [5, 5]
 
 
+@pytest.fixture
+def fake_hackrf_sweep_ignores_sigterm(tmp_path, monkeypatch):
+    """A fake hackrf_sweep that mimics a USB-wedged process: it installs a
+    SIGTERM handler that ignores the signal and never exits on its own --
+    the same failure mode a real hackrf_sweep can hit if it's stuck in a
+    libusb call after a USB reset/glitch. Only SIGKILL can stop it.
+    """
+    script = tmp_path / "hackrf_sweep"
+    script.write_text(
+        "#!/bin/sh\n"
+        "trap '' TERM\n"
+        "while true; do\n"
+        '  echo "2026-08-05, 14:23:01.000000, 2400000000, 2405000000, 1000.00, 20, -54.32, -61.10"\n'
+        "  sleep 0.01\n"
+        "done\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    return script
+
+
+def test_run_hackrf_sweep_kills_process_that_ignores_sigterm(fake_hackrf_sweep_ignores_sigterm):
+    """Regression test for the finding that an unbounded `await proc.wait()`
+    after terminate() in the finally block could hang this coroutine --
+    and therefore the whole scanner, since _sweep_band's retry-forever loop
+    depends on this function returning -- forever if hackrf_sweep doesn't
+    honor SIGTERM (e.g. wedged in a libusb call after a USB reset/glitch).
+    That's the exact failure mode ("device flaky, scanner silently stops
+    working") an earlier Critical fix in this file eliminated for the
+    early-exit case; this covers the SIGTERM-ignored trigger for it.
+
+    The call under test is wrapped in a generous but finite asyncio.wait_for
+    so a regression (unbounded hang) fails this test loudly with a
+    TimeoutError instead of hanging the whole suite.
+    """
+    from spectrum_source import _run_hackrf_sweep
+
+    async def run():
+        return await _run_hackrf_sweep(2_400_000_000, 2_405_000_000, duration_s=0.2)
+
+    # Budget: 0.2s sweep + up to 5s SIGTERM grace period + SIGKILL overhead.
+    # 8s leaves headroom without letting a real regression hang the suite.
+    readings = asyncio.run(asyncio.wait_for(run(), timeout=8))
+    assert readings  # sanity: it did collect readings before being killed
+
+
 def test_stream_hits_retries_calibration_on_zero_readings(monkeypatch):
     """average_power([]) == 0.0 must never be accepted as a real baseline:
     if a band's calibration pass yields zero readings, stream_hits should
