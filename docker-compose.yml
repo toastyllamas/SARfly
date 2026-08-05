@@ -60,12 +60,39 @@ services:
       # UBERTOOTH_DEVICE_INDEX: "0"
       LOG_LEVEL: INFO
 
+  # Third, independent capture unit -- a HackRF One doing wide-area energy
+  # detection across cellular/WiFi/ISM/keyfob bands rather than decoding a
+  # specific protocol. See
+  # docs/superpowers/specs/2026-08-05-multiband-spectrum-scanner-design.md.
+  # Writes into the same shared detections.sqlite3's spectrum_hits table,
+  # tagged with its own SOURCE_UNIT_ID. Starts unconditionally like the
+  # other two scanners -- if the HackRF isn't attached, spectrum_source.py
+  # logs a warning and retries every 5s forever.
+  scanner-spectrum:
+    build: ./services/scanner-spectrum
+    image: ble-sar-df-scanner-spectrum:local
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    volumes:
+      - ./data:/data
+    environment:
+      DB_PATH: /data/detections.sqlite3
+      GPSD_HOST: 127.0.0.1
+      GPSD_PORT: "2947"
+      SOURCE_UNIT_ID: ground-logger-spectrum-01
+      SPECTRUM_CALIBRATION_S: "10"
+      SPECTRUM_DWELL_S: "5"
+      SPECTRUM_HIT_MARGIN_DB: "10"
+      LOG_LEVEL: INFO
+
   ground-station:
     build: ./services/ground_station
     image: ble-sar-df-ground-station:local
     restart: unless-stopped
     depends_on:
       - scanner
+      - scanner-spectrum
     # No host networking or privileges needed here -- this service only
     # reads/writes the shared SQLite file and serves plain HTTP/WebSocket.
     ports:
