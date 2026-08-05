@@ -312,6 +312,15 @@ compose change).
   GPS is frequently stale. Revisit the baseline statistic (e.g. a high
   percentile instead of the mean) if false-positive rate remains high
   outdoors.
+- A browser tab that's disconnected from the WebSocket (e.g. a drone-to-
+  ground link blip) when someone clicks "Reset Database" will not clear its
+  spectrum-hits map layer on reconnect — it merges the fresh (now-empty)
+  state in by row id rather than blindly replacing, which fixed a worse bug
+  (reconnects truncating accumulated map history) but means a reset missed
+  while disconnected leaves stale markers on screen until the next explicit
+  reset happens while connected. Low-probability and self-healing with one
+  more click; a session/generation token on the reset broadcast would close
+  it properly if it proves disruptive in practice.
 - `privileged: true` on all three scanners is broader than strictly
   necessary; it can be narrowed once the host's D-Bus BlueZ policy is tuned
   (for `scanner`) and the exact USB caps are pinned down (for
