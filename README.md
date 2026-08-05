@@ -283,12 +283,27 @@ way a BLE device does).
 
 ## Raspberry Pi deployment
 
-The image is built from `python:3.12-slim`, which publishes multi-arch
-manifests (amd64/arm64), so the same `docker-compose.yml` builds and runs
-unmodified on a Pi. Copy the project over and run the same
-`docker compose up --build` — no compose file changes needed unless the Pi's
-GPS is on a different serial device (that's a gpsd/host config change, not a
-compose change).
+The final-stage image for every service is built from `python:3.12-slim`,
+which publishes multi-arch manifests (amd64/arm64), so the same
+`docker-compose.yml` builds and runs unmodified on a Pi. Copy the project
+over and run the same `docker compose up --build` — no compose file changes
+needed unless the Pi's GPS is on a different serial device (that's a
+gpsd/host config change, not a compose change).
+
+`scanner-ubertooth` and `scanner-spectrum` both compile their host tools
+(`ubertooth-btle`/`libbtbb`, and `hackrf_sweep`) from source in a
+`debian:trixie-slim` build stage rather than using prebuilt binaries — that
+base image is multi-arch too, so this still builds natively on a Pi with no
+changes, just noticeably slower than on a dev laptop the first time (real C
+compilation on Pi-class CPUs, not just a slow download). Budget extra time
+for the first `--build` on-device; subsequent builds are cached as usual.
+
+Running all three scanners (Sena UD100, Ubertooth One, HackRF One) plus a
+USB GPS on one Pi puts four USB radios on a board with a limited USB power
+budget, especially on a Pi 3 or Zero. If a scanner drops out intermittently
+or a device fails to enumerate, try a powered USB hub before assuming a
+software problem — this is a known sharp edge with SDR-class USB devices
+(the HackRF in particular) on Pi-class hardware.
 
 ## Known limitations / not yet built
 
