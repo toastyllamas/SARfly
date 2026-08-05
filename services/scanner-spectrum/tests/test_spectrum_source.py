@@ -85,3 +85,40 @@ def test_detect_hits_above_threshold():
 def test_detect_hits_none_above_threshold():
     readings = [(2450000000, -75.0)]
     assert detect_hits(readings, "ism_2_4ghz", baseline_dbm=-70.0, margin_db=10.0) == []
+
+
+import asyncio
+import os
+
+import pytest
+
+
+@pytest.fixture
+def fake_hackrf_sweep(tmp_path, monkeypatch):
+    script = tmp_path / "hackrf_sweep"
+    script.write_text(
+        "#!/bin/sh\n"
+        "while true; do\n"
+        '  echo "2026-08-05, 14:23:01.000000, 2400000000, 2405000000, 1000.00, 20, -54.32, -61.10"\n'
+        "  sleep 0.01\n"
+        "done\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    return script
+
+
+def test_run_hackrf_sweep_collects_readings(fake_hackrf_sweep):
+    from spectrum_source import _run_hackrf_sweep
+
+    readings = asyncio.run(_run_hackrf_sweep(2_400_000_000, 2_405_000_000, duration_s=0.1))
+    assert (2400000500, -54.32) in readings
+    assert (2400001500, -61.10) in readings
+
+
+def test_run_hackrf_sweep_raises_when_binary_missing(tmp_path, monkeypatch):
+    from spectrum_source import _run_hackrf_sweep
+
+    monkeypatch.setenv("PATH", str(tmp_path))  # empty dir, no hackrf_sweep on it
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(_run_hackrf_sweep(2_400_000_000, 2_405_000_000, duration_s=0.1))

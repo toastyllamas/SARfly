@@ -105,3 +105,103 @@ def detect_hits(
         for freq, power in readings
         if power > threshold
     ]
+
+
+import asyncio
+import logging
+import math
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_MARGIN_DB = 10.0
+DEFAULT_CALIBRATION_S = 10.0
+DEFAULT_DWELL_S = 5.0
+
+
+async def _log_stderr(stream: asyncio.StreamReader | None) -> None:
+    if stream is None:
+        return
+    async for raw_line in stream:
+        logger.warning("hackrf_sweep: %s", raw_line.decode(errors="replace").rstrip("\n"))
+
+
+async def _run_hackrf_sweep(low_hz: int, high_hz: int, duration_s: float) -> list[tuple[int, float]]:
+    """Run hackrf_sweep over [low_hz, high_hz) for duration_s seconds and
+    return every (center_freq_hz, power_dbm) reading collected.
+
+    hackrf_sweep takes its range as whole MHz; floor the low edge and
+    ceil the high edge so the requested band is always fully covered
+    even when its bounds aren't MHz-aligned (e.g. the ISM band's
+    2483.5 MHz upper edge).
+    """
+    low_mhz = low_hz // 1_000_000
+    high_mhz = math.ceil(high_hz / 1_000_000)
+    args = ["hackrf_sweep", "-f", f"{low_mhz}:{high_mhz}"]
+
+    readings: list[tuple[int, float]] = []
+    proc = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    stderr_task = asyncio.create_task(_log_stderr(proc.stderr))
+
+    async def _read() -> None:
+        assert proc.stdout is not None
+        async for raw_line in proc.stdout:
+            readings.extend(_readings_from_line(raw_line.decode(errors="replace")))
+
+    try:
+        await asyncio.wait_for(_read(), timeout=duration_s)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        stderr_task.cancel()
+        if proc.returncode is None:
+            proc.terminate()
+            await proc.wait()
+
+    return readings
+
+
+async def _sweep_band(band: Band, duration_s: float) -> list[tuple[int, float]]:
+    """Run _run_hackrf_sweep for one band, retrying forever every 5s if the
+    binary is missing or the sweep fails (e.g. device unplugged mid-run) --
+    same reconnect philosophy as GpsClient.run().
+    """
+    while True:
+        try:
+            return await _run_hackrf_sweep(band.low_hz, band.high_hz, duration_s)
+        except FileNotFoundError:
+            logger.error("hackrf_sweep not found on PATH; is it installed?")
+            await asyncio.sleep(5)
+        except OSError as exc:
+            logger.warning("hackrf_sweep failed for band %s (%s); retrying in 5s", band.name, exc)
+            await asyncio.sleep(5)
+
+
+async def stream_hits(
+    margin_db: float = DEFAULT_MARGIN_DB,
+    calibration_s: float = DEFAULT_CALIBRATION_S,
+    dwell_s: float = DEFAULT_DWELL_S,
+    bands: list[Band] | None = None,
+):
+    """Calibrate a baseline across all bands once, then sweep them forever,
+    yielding SpectrumHitReading for every bin that exceeds its band's
+    calibrated baseline + margin_db.
+    """
+    active_bands = bands if bands is not None else DEFAULT_BANDS
+
+    baseline: dict[str, float] = {}
+    logger.info("calibrating baseline for %d bands (%.0fs each)...", len(active_bands), calibration_s)
+    for band in active_bands:
+        readings = await _sweep_band(band, calibration_s)
+        powers = [p for _, p in readings]
+        baseline[band.name] = average_power(powers)
+        logger.info(
+            "baseline[%s] = %.1f dBm (%d samples)", band.name, baseline[band.name], len(powers)
+        )
+
+    while True:
+        for band in active_bands:
+            readings = await _sweep_band(band, dwell_s)
+            for hit in detect_hits(readings, band.name, baseline[band.name], margin_db):
+                yield hit
