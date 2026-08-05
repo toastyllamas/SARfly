@@ -91,7 +91,7 @@ async def run() -> None:
                 gps_fix_age_s=fix_age,
             )
             storage.insert_hit(hit)
-            logger.info(
+            logger.debug(
                 "hit band=%s freq=%.3fMHz power=%.1fdBm baseline=%.1fdBm lat=%s lon=%s",
                 hit.band,
                 hit.freq_hz / 1_000_000,
