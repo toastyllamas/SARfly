@@ -197,10 +197,13 @@ let devices = [];
 let frozenMac = null;
 let hasFitBounds = false;
 // Hits from the multi-band spectrum scanner (Component F). Unlike `devices`
-// (always the full current set on every WS message), the server only ever
-// sends *new* hits after the initial connect snapshot -- see the
-// `msg.type === 'spectrum_hits'` handler below for why this gets appended
-// to, not replaced, except on an explicit reset.
+// (always the full current set on every WS message), spectrum_hits messages
+// are merged into this array by `id` rather than replaced outright -- see
+// mergeSpectrumHits and the `msg.type === 'spectrum_hits'` handler below for
+// why (short version: a reconnect's "initial" snapshot only covers the
+// server's latest 2000 rows, and a client that already has more history
+// than that must not lose it, but also must not duplicate whatever overlaps
+// between the snapshot and what it already has).
 let spectrumHits = [];
 const MAX_SPECTRUM_HITS = 5000; // client-side cap so a long mission doesn't grow this unbounded
 const BAND_COLORS = {
@@ -564,20 +567,71 @@ function rebuildSpectrumLayer() {
   }
 }
 
-// Incremental path for a normal delta message: add markers for the
-// newly-arrived hits only, without touching any marker already on the map.
-// Also evicts markers for whatever spectrumHits trimmed off its front to
-// respect MAX_SPECTRUM_HITS, so the layer doesn't grow unbounded past the
-// same cap the hits array itself enforces.
-function addSpectrumHitMarkers(newHits) {
-  for (const h of newHits) {
-    const m = makeSpectrumMarker(h);
-    spectrumMarkers.push(m);
-    if (m && showSpectrum.checked) m.addTo(spectrumLayer);
+// Incremental path for any non-reset spectrum_hits message -- both the
+// initial/reconnect snapshot and every routine poll-loop delta arrive this
+// way, and are merged into spectrumHits by `id` rather than the caller
+// choosing between "replace" (drops history the tab already had past the
+// server's latest MAX_SPECTRUM_HITS-row snapshot) or "append" (duplicates
+// markers, since a reconnect's snapshot isn't relative to what this tab
+// last saw). Each incoming hit either updates the existing entry at its
+// index (a duplicate -- e.g. from the race in ws_endpoint, where a
+// poll_loop broadcast can slip in between the server registering the
+// connection and it sending the initial snapshot) or gets appended as new.
+// This makes the merge idempotent and agnostic to arrival order/duplication
+// across messages -- it doesn't matter which message a given row first
+// shows up in, or how many times it shows up.
+//
+// Ordering note: spectrum_hits_since() (every poll_loop delta) returns rows
+// ascending by id, but recent_spectrum_hits() (the initial/reconnect
+// snapshot) returns them DESCENDING by id -- so this can't assume incoming
+// batches are pre-sorted relative to spectrumHits's own ascending order.
+// Newly-appended rows are explicitly re-sorted into place by id rather than
+// assumed to land at the end already in order.
+function mergeSpectrumHits(newHits) {
+  if (newHits.length === 0) return;
+
+  const indexById = new Map();
+  for (let i = 0; i < spectrumHits.length; i++) {
+    indexById.set(spectrumHits[i].id, i);
   }
-  while (spectrumMarkers.length > spectrumHits.length) {
-    const evicted = spectrumMarkers.shift();
-    if (evicted) spectrumLayer.removeLayer(evicted);
+
+  let appended = false;
+  for (const hit of newHits) {
+    const idx = indexById.get(hit.id);
+    if (idx !== undefined) {
+      // Already have this row (duplicate delivery). Rows are immutable
+      // once inserted, so just refresh the cached object -- no need to
+      // touch its marker or the layer.
+      spectrumHits[idx] = hit;
+    } else {
+      const marker = makeSpectrumMarker(hit);
+      if (marker && showSpectrum.checked) marker.addTo(spectrumLayer);
+      indexById.set(hit.id, spectrumHits.length);
+      spectrumHits.push(hit);
+      spectrumMarkers.push(marker);
+      appended = true;
+    }
+  }
+
+  if (appended) {
+    // Re-sort spectrumHits ascending by id, carrying spectrumMarkers along
+    // in lockstep so the two stay 1:1 index-aligned. This only reorders the
+    // two JS arrays -- it doesn't touch the Leaflet layer, which markers
+    // were already added to (or not) above and doesn't care about order.
+    const paired = spectrumHits.map((h, i) => [h, spectrumMarkers[i]]);
+    paired.sort((a, b) => a[0].id - b[0].id);
+    spectrumHits = paired.map((p) => p[0]);
+    spectrumMarkers = paired.map((p) => p[1]);
+  }
+
+  if (spectrumHits.length > MAX_SPECTRUM_HITS) {
+    const excess = spectrumHits.length - MAX_SPECTRUM_HITS;
+    const evicted = spectrumMarkers.slice(0, excess);
+    spectrumHits = spectrumHits.slice(excess);
+    spectrumMarkers = spectrumMarkers.slice(excess);
+    for (const m of evicted) {
+      if (m) spectrumLayer.removeLayer(m);
+    }
   }
 }
 
@@ -807,14 +861,6 @@ recomputeAutoSpacing();
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
   const ws = new WebSocket(proto + location.host + '/ws');
-  // The server doesn't flag its very first spectrum_hits message on a
-  // connection as special -- it just sends the full recent_spectrum_hits()
-  // snapshot with no `reset`. Track that per-connection so we know to
-  // *replace* spectrumHits (full rebuild) on that one message instead of
-  // blindly concatenating onto whatever this tab already had (which would
-  // duplicate markers after a reconnect, since the reconnect's "initial"
-  // snapshot isn't relative to what this client last saw).
-  let receivedInitialSpectrumSnapshot = false;
   ws.onopen = () => dot.classList.add('connected');
   ws.onclose = () => { dot.classList.remove('connected'); setTimeout(connect, 2000); };
   ws.onerror = () => ws.close();
@@ -837,28 +883,23 @@ function connect() {
         render();
       }
     } else if (msg.type === 'spectrum_hits') {
-      // The initial connect snapshot and every later poll-loop delta both
-      // arrive as this same message type. Two cases need a full
-      // clear+rebuild of the layer: an explicit reset (msg.reset, sent
-      // only by /api/reset) and the first message on this connection (the
-      // full recent-hits snapshot, which replaces rather than appends).
-      // Every other message is a small delta of newly-arrived hits only,
-      // and just needs those new markers added incrementally -- rebuilding
-      // all (up to MAX_SPECTRUM_HITS) markers on every ~1s poll tick is
-      // exactly the cost Fix 5 removes.
-      if (msg.reset || !receivedInitialSpectrumSnapshot) {
-        receivedInitialSpectrumSnapshot = true;
-        spectrumHits = msg.hits;
-        if (spectrumHits.length > MAX_SPECTRUM_HITS) {
-          spectrumHits = spectrumHits.slice(spectrumHits.length - MAX_SPECTRUM_HITS);
-        }
+      // The initial/reconnect snapshot and every later poll-loop delta both
+      // arrive as this same message type. Only an explicit reset (msg.reset,
+      // sent only by /api/reset) fully clears; every other message -- the
+      // snapshot included -- gets merged into spectrumHits by `id` (see
+      // mergeSpectrumHits) instead of replacing it (which would drop
+      // history older than the server's latest snapshot on a routine
+      // reconnect) or blindly appending it (which would duplicate markers,
+      // since a reconnect's snapshot isn't relative to what this tab last
+      // saw). Because the merge is idempotent and order-agnostic, it also
+      // doesn't matter that ws_endpoint registers the connection with the
+      // broadcast manager before sending the initial snapshot -- a
+      // poll_loop delta that races in ahead of it just merges cleanly too.
+      if (msg.reset) {
+        spectrumHits = [];
         rebuildSpectrumLayer();
       } else {
-        spectrumHits = spectrumHits.concat(msg.hits);
-        if (spectrumHits.length > MAX_SPECTRUM_HITS) {
-          spectrumHits = spectrumHits.slice(spectrumHits.length - MAX_SPECTRUM_HITS);
-        }
-        addSpectrumHitMarkers(msg.hits);
+        mergeSpectrumHits(msg.hits);
       }
     }
   };
