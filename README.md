@@ -214,7 +214,7 @@ Environment variables (set in `docker-compose.yml`):
 | `SOURCE_UNIT_ID` | `ground-logger-spectrum-01` | Kept distinct so this unit's hits are separately attributable once merged |
 | `SPECTRUM_CALIBRATION_S` | `10` | Seconds to sample each band at startup when establishing that flight's baseline |
 | `SPECTRUM_DWELL_S` | `5` | Seconds to sweep each band per pass once calibration is done |
-| `SPECTRUM_HIT_MARGIN_DB` | `10` | How far above a band's calibrated baseline a reading must be to count as a hit |
+| `SPECTRUM_HIT_MARGIN_DB` | `10` | How far above a reading's own frequency bin's calibrated baseline it must be to count as a hit |
 
 **ground-station**
 
@@ -265,7 +265,10 @@ list — personal hotspots generally favor 2.4 GHz for range.
 On startup it samples each band for `SPECTRUM_CALIBRATION_S` seconds to
 establish that flight's own ambient-noise baseline before any drone motion
 is assumed to have started, then sweeps the bands forever, flagging any
-reading `SPECTRUM_HIT_MARGIN_DB` above its band's baseline as a hit. This
+reading `SPECTRUM_HIT_MARGIN_DB` above **its own frequency bin's** calibrated
+baseline as a hit — the baseline is per-bin, not a single average across the
+whole band, so a bin that's always occupied (a nearby WiFi AP, a cell
+carrier) doesn't push every other bin's threshold up with it. This
 is a per-flight baseline, not a continuously adapting one, by design — see
 `docs/superpowers/specs/2026-08-05-multiband-spectrum-scanner-design.md`
 for the full rationale, including why a single wideband panel antenna and
@@ -297,6 +300,18 @@ compose change).
 - No device-track history on the map yet — it only plots each device's
   latest position, not its path over time. The heatmap shows historical
   density but not direction of travel.
+- In a bench test with real hardware in a busy indoor RF environment,
+  `scanner-spectrum` logged spectrum hits at ~55/s even after switching to
+  per-bin baselines — likely still elevated by the calibration baseline
+  being a simple mean per bin rather than a percentile, so a bin with
+  bursty (not constant) occupancy can clear its own threshold repeatedly.
+  At sustained rates like this, each per-hit log line is emitted at DEBUG
+  (quiet by default), but a co-located per-hit GPS-staleness check still
+  logs at WARNING on every hit when the GPS fix is stale — worth watching
+  log volume on an SD-card-backed SBC in a canopy/urban-canyon flight where
+  GPS is frequently stale. Revisit the baseline statistic (e.g. a high
+  percentile instead of the mean) if false-positive rate remains high
+  outdoors.
 - `privileged: true` on all three scanners is broader than strictly
   necessary; it can be narrowed once the host's D-Bus BlueZ policy is tuned
   (for `scanner`) and the exact USB caps are pinned down (for
