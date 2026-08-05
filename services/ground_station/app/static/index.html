@@ -287,7 +287,11 @@ showHeatmap.addEventListener('change', () => {
 const showSpectrum = document.getElementById('show-spectrum');
 showSpectrum.addEventListener('change', () => {
   if (showSpectrum.checked) spectrumLayer.addTo(map); else map.removeLayer(spectrumLayer);
-  renderSpectrumHits();
+  // Toggling is the one place a full rebuild from the current spectrumHits
+  // state is genuinely needed (turning it on mid-mission should show
+  // everything accumulated so far; turning it off should drop the
+  // now-hidden layer's markers rather than let them sit around unused).
+  rebuildSpectrumLayer();
 });
 let searchDebounce = null;
 searchInput.addEventListener('input', () => {
@@ -527,21 +531,53 @@ async function updateHeatmap(query) {
   }
 }
 
-function renderSpectrumHits() {
+// Markers currently reflected in spectrumLayer, kept in the same order and
+// 1:1 index alignment with spectrumHits (a null entry for a hit with no
+// GPS fix, so trimming stays aligned by index without needing to search).
+let spectrumMarkers = [];
+
+function makeSpectrumMarker(h) {
+  if (h.lat == null || h.lon == null) return null;
+  const color = BAND_COLORS[h.band] || '#ffffff';
+  return L.circleMarker([h.lat, h.lon], {
+    radius: 5,
+    color,
+    fillColor: color,
+    fillOpacity: 0.7,
+    weight: 1,
+  }).bindTooltip(
+    `${h.band} @ ${(h.freq_hz / 1e6).toFixed(1)} MHz\n${h.power_dbm.toFixed(1)} dBm (baseline ${h.baseline_dbm.toFixed(1)})`
+  );
+}
+
+// Full clear + rebuild from the current spectrumHits array. Only needed for
+// the initial connect snapshot, an explicit /api/reset, or the operator
+// toggling the layer on -- NOT for every routine delta, since with
+// MAX_SPECTRUM_HITS = 5000 that would mean recreating up to 5000 Leaflet
+// markers on every poll tick while hits are streaming in.
+function rebuildSpectrumLayer() {
   spectrumLayer.clearLayers();
+  spectrumMarkers = spectrumHits.map(makeSpectrumMarker);
   if (!showSpectrum.checked) return;
-  for (const h of spectrumHits) {
-    if (h.lat == null || h.lon == null) continue;
-    const color = BAND_COLORS[h.band] || '#ffffff';
-    L.circleMarker([h.lat, h.lon], {
-      radius: 5,
-      color,
-      fillColor: color,
-      fillOpacity: 0.7,
-      weight: 1,
-    }).bindTooltip(
-      `${h.band} @ ${(h.freq_hz / 1e6).toFixed(1)} MHz\n${h.power_dbm.toFixed(1)} dBm (baseline ${h.baseline_dbm.toFixed(1)})`
-    ).addTo(spectrumLayer);
+  for (const m of spectrumMarkers) {
+    if (m) m.addTo(spectrumLayer);
+  }
+}
+
+// Incremental path for a normal delta message: add markers for the
+// newly-arrived hits only, without touching any marker already on the map.
+// Also evicts markers for whatever spectrumHits trimmed off its front to
+// respect MAX_SPECTRUM_HITS, so the layer doesn't grow unbounded past the
+// same cap the hits array itself enforces.
+function addSpectrumHitMarkers(newHits) {
+  for (const h of newHits) {
+    const m = makeSpectrumMarker(h);
+    spectrumMarkers.push(m);
+    if (m && showSpectrum.checked) m.addTo(spectrumLayer);
+  }
+  while (spectrumMarkers.length > spectrumHits.length) {
+    const evicted = spectrumMarkers.shift();
+    if (evicted) spectrumLayer.removeLayer(evicted);
   }
 }
 
@@ -771,6 +807,14 @@ recomputeAutoSpacing();
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
   const ws = new WebSocket(proto + location.host + '/ws');
+  // The server doesn't flag its very first spectrum_hits message on a
+  // connection as special -- it just sends the full recent_spectrum_hits()
+  // snapshot with no `reset`. Track that per-connection so we know to
+  // *replace* spectrumHits (full rebuild) on that one message instead of
+  // blindly concatenating onto whatever this tab already had (which would
+  // duplicate markers after a reconnect, since the reconnect's "initial"
+  // snapshot isn't relative to what this client last saw).
+  let receivedInitialSpectrumSnapshot = false;
   ws.onopen = () => dot.classList.add('connected');
   ws.onclose = () => { dot.classList.remove('connected'); setTimeout(connect, 2000); };
   ws.onerror = () => ws.close();
@@ -794,13 +838,28 @@ function connect() {
       }
     } else if (msg.type === 'spectrum_hits') {
       // The initial connect snapshot and every later poll-loop delta both
-      // arrive as this same message type -- reset:true (only sent by
-      // /api/reset) is the one case that replaces instead of appends.
-      spectrumHits = msg.reset ? msg.hits : spectrumHits.concat(msg.hits);
-      if (spectrumHits.length > MAX_SPECTRUM_HITS) {
-        spectrumHits = spectrumHits.slice(spectrumHits.length - MAX_SPECTRUM_HITS);
+      // arrive as this same message type. Two cases need a full
+      // clear+rebuild of the layer: an explicit reset (msg.reset, sent
+      // only by /api/reset) and the first message on this connection (the
+      // full recent-hits snapshot, which replaces rather than appends).
+      // Every other message is a small delta of newly-arrived hits only,
+      // and just needs those new markers added incrementally -- rebuilding
+      // all (up to MAX_SPECTRUM_HITS) markers on every ~1s poll tick is
+      // exactly the cost Fix 5 removes.
+      if (msg.reset || !receivedInitialSpectrumSnapshot) {
+        receivedInitialSpectrumSnapshot = true;
+        spectrumHits = msg.hits;
+        if (spectrumHits.length > MAX_SPECTRUM_HITS) {
+          spectrumHits = spectrumHits.slice(spectrumHits.length - MAX_SPECTRUM_HITS);
+        }
+        rebuildSpectrumLayer();
+      } else {
+        spectrumHits = spectrumHits.concat(msg.hits);
+        if (spectrumHits.length > MAX_SPECTRUM_HITS) {
+          spectrumHits = spectrumHits.slice(spectrumHits.length - MAX_SPECTRUM_HITS);
+        }
+        addSpectrumHitMarkers(msg.hits);
       }
-      renderSpectrumHits();
     }
   };
 }
