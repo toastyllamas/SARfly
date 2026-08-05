@@ -233,11 +233,24 @@ async def _run_hackrf_sweep(low_hz: int, high_hz: int, duration_s: float) -> lis
                 # scanner, since _sweep_band's retry-forever loop depends on
                 # this function returning) exactly like the early-exit bug
                 # this file's Fix 2 eliminated, just triggered by a stuck
-                # process instead of a fast one. SIGKILL is not ignorable by
-                # a normal process, so this second wait() is expected to
-                # return promptly.
+                # process instead of a fast one.
                 proc.kill()
-                await proc.wait()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    # Even SIGKILL doesn't return until the kernel does --
+                    # a process blocked in an uninterruptible (D-state) sleep
+                    # inside a usbfs ioctl after a USB reset can outlive it.
+                    # Raise rather than wait forever a second time; the leaked
+                    # zombie is an acceptable cost next to a permanently
+                    # silent, unretrying scanner. The next _sweep_band retry
+                    # will fail fast on hackrf_open() (device still claimed
+                    # by the wedged process) and log/backoff normally.
+                    raise OSError(
+                        f"hackrf_sweep (pid={proc.pid}) did not exit even after "
+                        f"SIGKILL while sweeping {low_mhz}:{high_mhz} MHz -- "
+                        f"likely wedged in an uninterruptible USB syscall"
+                    ) from None
 
     if not timed_out or exited_returncode not in (None, 0):
         stderr_context = " | ".join(stderr_lines) or "(no stderr output captured)"

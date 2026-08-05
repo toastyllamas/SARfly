@@ -302,6 +302,42 @@ def test_run_hackrf_sweep_kills_process_that_ignores_sigterm(fake_hackrf_sweep_i
     assert readings  # sanity: it did collect readings before being killed
 
 
+def test_run_hackrf_sweep_raises_when_even_sigkill_does_not_reap(
+    fake_hackrf_sweep_ignores_sigterm, monkeypatch
+):
+    """Regression test for the finding that the post-SIGKILL `await
+    proc.wait()` was itself unbounded: a process blocked in an
+    uninterruptible (D-state) kernel sleep inside a usbfs ioctl after a real
+    USB reset does not die on SIGKILL until the syscall returns, so a
+    real-world wedge can reach this exact path. A genuine D-state process
+    can't be safely manufactured in a test, so `Process.wait` is patched to
+    never return -- from this coroutine's perspective that's indistinguishable
+    from the OS not having reaped a killed-but-not-yet-dead child, which is
+    exactly the scenario the fix must not hang on.
+
+    The real fake_hackrf_sweep script (which ignores SIGTERM) still runs and
+    is genuinely SIGKILLed -- only the parent's ability to observe that via
+    wait() is what's patched out, so proc.kill() itself is exercised for
+    real, just never resolved.
+    """
+    from spectrum_source import _run_hackrf_sweep
+
+    async def hang_forever(self) -> int:
+        await asyncio.sleep(999)
+        return -9  # pragma: no cover -- never reached within the test timeout
+
+    monkeypatch.setattr(asyncio.subprocess.Process, "wait", hang_forever)
+
+    async def run():
+        return await _run_hackrf_sweep(2_400_000_000, 2_405_000_000, duration_s=0.2)
+
+    # Budget: 0.2s sweep + 5s SIGTERM wait_for + 5s SIGKILL wait_for. 12s
+    # leaves headroom without letting a real regression (unbounded hang)
+    # take down the whole suite.
+    with pytest.raises(OSError, match="SIGKILL"):
+        asyncio.run(asyncio.wait_for(run(), timeout=12))
+
+
 def test_stream_hits_retries_calibration_on_zero_readings(monkeypatch):
     """average_power([]) == 0.0 must never be accepted as a real baseline:
     if a band's calibration pass yields zero readings, stream_hits should
