@@ -60,6 +60,7 @@ manager = ConnectionManager()
 
 async def poll_loop() -> None:
     last_id = db.max_detection_id()
+    last_spectrum_id = db.max_spectrum_hit_id()
     while True:
         await asyncio.sleep(POLL_INTERVAL_S)
         new_rows = db.detections_since(last_id)
@@ -70,6 +71,15 @@ async def poll_loop() -> None:
                     "type": "devices",
                     "devices": db.device_summary(),
                     "new_count": len(new_rows),
+                }
+            )
+        new_spectrum_rows = db.spectrum_hits_since(last_spectrum_id)
+        if new_spectrum_rows:
+            last_spectrum_id = new_spectrum_rows[-1]["id"]
+            await manager.broadcast(
+                {
+                    "type": "spectrum_hits",
+                    "hits": [dict(r) for r in new_spectrum_rows],
                 }
             )
 
@@ -102,6 +112,11 @@ async def api_heatmap(mac: str | None = None) -> list[dict]:
     return db.heatmap(mac_filter=mac, precision=GRID_PRECISION)
 
 
+@app.get("/api/spectrum_hits")
+async def api_spectrum_hits() -> list[dict]:
+    return db.recent_spectrum_hits()
+
+
 @app.post("/api/devices/{mac}/tag")
 async def api_tag(mac: str, body: dict) -> dict:
     status = body.get("status", "unknown")
@@ -124,6 +139,7 @@ async def api_bulk_tag(body: dict) -> dict:
 async def api_reset() -> dict:
     db.reset()
     await manager.broadcast({"type": "devices", "devices": db.device_summary()})
+    await manager.broadcast({"type": "spectrum_hits", "hits": [], "reset": True})
     return {"ok": True}
 
 
@@ -142,6 +158,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
     await manager.connect(ws)
     try:
         await ws.send_json({"type": "devices", "devices": db.device_summary()})
+        await ws.send_json({"type": "spectrum_hits", "hits": db.recent_spectrum_hits()})
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
