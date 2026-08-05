@@ -131,6 +131,39 @@ class Database:
         rows = self._conn.execute(query, params).fetchall()
         return [{"lat": r["glat"], "lon": r["glon"], "hits": r["hits"]} for r in rows]
 
+    def max_spectrum_hit_id(self) -> int:
+        try:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS m FROM spectrum_hits"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return 0  # scanner-spectrum hasn't run yet, or isn't deployed at all
+        return row["m"]
+
+    def spectrum_hits_since(self, since_id: int) -> list[sqlite3.Row]:
+        try:
+            return self._conn.execute(
+                "SELECT * FROM spectrum_hits WHERE id > ? ORDER BY id", (since_id,)
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+    def recent_spectrum_hits(self, limit: int = 2000) -> list[dict]:
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT id, timestamp_utc, source_unit_id, band, freq_hz, power_dbm,
+                       baseline_dbm, lat, lon, alt_m, gps_fix_age_s
+                FROM spectrum_hits
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [dict(r) for r in rows]
+
     def set_tag(self, mac: str, status: str, label: str | None) -> None:
         self._conn.execute(
             """
@@ -145,13 +178,23 @@ class Database:
         )
 
     def reset(self) -> None:
-        """Wipe all detections and tags. Deliberately leaves sqlite's
-        autoincrement bookkeeping alone so new ids keep climbing rather than
-        restarting at 1 -- that keeps the poll loop's "highest id seen so
-        far" tracking valid with no extra coordination after a reset.
+        """Wipe all detections, spectrum hits, and tags. Deliberately leaves
+        sqlite's autoincrement bookkeeping alone so new ids keep climbing
+        rather than restarting at 1 -- that keeps the poll loop's "highest id
+        seen so far" tracking valid with no extra coordination after a reset.
         """
-        self._conn.execute("DELETE FROM detections")
-        self._conn.execute("DELETE FROM device_tags")
+        try:
+            self._conn.execute("DELETE FROM detections")
+        except sqlite3.OperationalError:
+            pass  # scanner may not have created it yet
+        try:
+            self._conn.execute("DELETE FROM device_tags")
+        except sqlite3.OperationalError:
+            pass  # unlikely, but handle gracefully
+        try:
+            self._conn.execute("DELETE FROM spectrum_hits")
+        except sqlite3.OperationalError:
+            pass  # scanner-spectrum never deployed -- nothing to clear
 
     def bulk_set_status(self, macs: list[str], status: str) -> None:
         """Set status for many devices at once, preserving any existing
