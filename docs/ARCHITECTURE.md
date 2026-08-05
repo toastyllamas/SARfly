@@ -151,21 +151,47 @@ area to 8×8 mi in the first place (last known position, trail network,
 drainage/terrain funneling) to prioritize sub-grids, and treat the full-box
 sweep as a fallback, not the default plan.
 
+### F. Multi-Band Spectrum Scanner (HackRF, Phase 1 supplement)
+
+A different, additive idea from Component E above: rather than trying to
+see the whole BLE-shaped RF picture in one wideband capture, this sweeps a
+fixed list of narrower, disjoint bands that *other* commercial device
+categories use — cellular, WiFi, the shared 2.4 GHz ISM band, and sub-GHz
+keyfobs — accepting sequential retuning as a deliberate tradeoff instead of
+requiring ≥80 MHz instantaneous bandwidth hardware. Built with a HackRF One
+(20 MHz instantaneous bandwidth, already in the BOM) running `hackrf_sweep`,
+a single wideband downward-facing panel antenna, and simple
+energy-threshold detection against a per-flight calibrated baseline — no
+burst-shape classification. A hit is an investigatory lead ("something's
+transmitting here"), not an identified device, feeding the same Phase 2
+cueing step as Components A/B/D. Implemented as its own service
+(`services/scanner-spectrum/`); see
+`docs/superpowers/specs/2026-08-05-multiband-spectrum-scanner-design.md`
+for the full design, including the default band list and why 5 GHz WiFi
+and burst-shape classification were left out for now.
+
 ## 3. Data Model
 
-Every detection is one record, same schema across all units so logs merge
-cleanly at the ground station:
+Every BLE detection (Components A/B/D) is one record, same schema across
+all units so logs merge cleanly at the ground station:
 
 ```
 timestamp_utc, lat, lon, alt_m, source_unit_id, mac_or_uuid,
 device_name, rssi_dbm, tx_power_dbm (if advertised), adv_raw_hex
 ```
 
-Component E's unclassified RF hits use the same table with `mac_or_uuid`,
-`device_name`, and `adv_raw_hex` left null and `rssi_dbm` populated from the
-energy-detector's power estimate — they cluster into the Phase 2 heatmap
-identically to tagged/unknown device hits, just with nothing to show in the
-name/MAC columns.
+Component F's spectrum hits are **not** stored in this table — as built,
+they live in a separate `spectrum_hits` table (`timestamp_utc,
+source_unit_id, band, freq_hz, power_dbm, baseline_dbm, lat, lon, alt_m,
+gps_fix_age_s`), since a hit has no MAC/device-name identity to fill those
+columns with and forcing it into the device-shaped schema would just
+produce null-heavy rows. This diverges from this section's original sketch
+(which assumed Component E's unclassified hits would reuse the `detections`
+table with `mac_or_uuid`/`device_name` left null) — the ground-station UI
+renders them as an independent map layer instead of folding them into the
+same device table/heatmap. If Component E (wideband simultaneous-capture
+energy detection) is ever built, revisit whether it shares Component F's
+`spectrum_hits` table or needs its own.
 
 ## 4. Hardware Sketch (to be firmed up into a BOM)
 
@@ -177,6 +203,7 @@ name/MAC columns.
 | Yagi antenna | 2.4 GHz, 12–16 element | Close-in bearing |
 | SDR, close-in DF (D, optional v2) | HackRF One or RTL-SDR v3/v4 | Single-channel RSSI is enough here; only if BLE-native RSSI-peak DF proves insufficient |
 | SDR, wide-area energy detector (E, optional v2) | LimeSDR Mini 2.0 or bladeRF 2.0 micro | Needs ≥80 MHz instantaneous bandwidth to see the full ISM band in one capture — HackRF/RTL-SDR are too narrow for this role |
+| SDR, multi-band spectrum scanner (F) | HackRF One | Built and validated — see `services/scanner-spectrum/`. 20 MHz instantaneous bandwidth is enough here since it sweeps disjoint narrow bands sequentially rather than capturing the whole ISM band at once |
 | GPS | u-blox NEO-M8N/M9N | Or reuse flight controller GPS via MAVLink on the drone unit |
 | SBC | Raspberry Pi 4/5 (ground station), Pi Zero 2 W if a drone-side SBC is ever needed | MCU-only is preferred on the drone for weight/power; add an SBC there only if you need onboard clustering/mapping mid-flight |
 | Telemetry downlink | Reuse existing drone telemetry/companion-computer link if present; otherwise LoRa for range at low bandwidth (fine — detection events are tiny) | Avoid a second WiFi radio on the drone; it's just more self-interference |
@@ -225,3 +252,7 @@ interrogation/paging rather than passive advertisement scanning.
    Questions 5–6 above confirm it's needed; validate the wideband-SDR +
    burst classifier against a known BLE connection on the bench (e.g. a
    phone/watch pair) before ever putting it on the drone.
+6. Multi-band spectrum scanner (F) — independent of (E), built using the
+   HackRF already in hand. See
+   `docs/superpowers/plans/2026-08-05-multiband-spectrum-scanner.md` for
+   the implementation plan.

@@ -14,11 +14,12 @@ design (baseline → wide-area sweep → cueing → close-in DF → confirmation
 |---|---|---|
 | Primary BLE scanner | Sena UD100, or any BlueZ-recognized adapter | Validated end-to-end |
 | Secondary BLE scanner | Ubertooth One | Validated end-to-end, including independent CRC-24 verification (see [Ubertooth notes](#ubertooth-notes)) |
+| Multi-band spectrum scanner | HackRF One | Validated end-to-end (see [Spectrum scanner notes](#spectrum-scanner-notes)) |
 | GPS | Any NMEA-capable USB/serial module, via gpsd | Validated end-to-end |
 
-The two scanners are independent and additive, not either/or: run one, the
-other, or both at once, and every detection lands in the same shared log
-regardless of which radio saw it. Neither is required to be physically
+The three scanners are independent and additive, not either/or: run any
+subset of them at once, and every detection/hit lands in the same shared
+log regardless of which radio saw it. None is required to be physically
 present for the stack to start — see [Running](#running).
 
 ## Contents
@@ -28,6 +29,7 @@ present for the stack to start — see [Running](#running).
 - [Ground-station UI](#ground-station-ui)
 - [Configuration](#configuration)
 - [Ubertooth notes](#ubertooth-notes)
+- [Spectrum scanner notes](#spectrum-scanner-notes)
 - [Raspberry Pi deployment](#raspberry-pi-deployment)
 - [Known limitations / not yet built](#known-limitations--not-yet-built)
 
@@ -80,6 +82,12 @@ dev laptop and on the Raspberry Pi target.
    (Host udev rules only matter for running `ubertooth-btle` directly on the
    host, outside Docker — e.g. ad-hoc testing.)
 
+5. **HackRF One (optional)** — plug it in; confirm with
+   `lsusb | grep -i hackrf` (vendor:product `1d50:6089`). Like the
+   Ubertooth, it needs no host-side driver setup for the Docker path:
+   `scanner-spectrum` runs `privileged: true` for raw USB access, and
+   `hackrf_sweep` is built into that container's own image.
+
 ## Running
 
 ```bash
@@ -87,13 +95,13 @@ cd ble-sar-df
 docker compose up --build
 ```
 
-This always starts all three services, regardless of which adapters are
-physically present — `scanner` and `scanner-ubertooth` each retry quietly
-in the background rather than blocking anything if their radio is missing
-(see [Known limitations](#known-limitations--not-yet-built)). One command
-works unattended whether the host has the UD100, the Ubertooth, both, or
-neither yet — the point of that design is a field SBC that boots this stack
-with no one there to pass a flag.
+This always starts all four services, regardless of which adapters are
+physically present — `scanner`, `scanner-ubertooth`, and `scanner-spectrum`
+each retry quietly in the background rather than blocking anything if their
+radio is missing (see [Known limitations](#known-limitations--not-yet-built)).
+One command works unattended whether the host has any, all, or none of the
+UD100/Ubertooth/HackRF yet — the point of that design is a field SBC that
+boots this stack with no one there to pass a flag.
 
 Detections accumulate in `./data/detections.sqlite3` on the host (bind-mounted,
 so the log survives container restarts/rebuilds). Inspect with:
@@ -165,6 +173,14 @@ Open **http://localhost:8080** for the ground-station UI.
   same way as the map, with MAC/RSSI/first-seen/last-seen/count in each
   placemark's description.
 - **Night mode** swaps to a red-on-black theme for dark-adapted/NVG use.
+- **Spectrum hits** layer (off by default) plots hits from the multi-band
+  spectrum scanner, colored by band (cellular orange, 2.4GHz ISM purple,
+  keyfob yellow). A hit is energy above that band's per-flight calibrated
+  baseline in a frequency range commercial devices use — not a decoded,
+  identified device the way a BLE detection is, so it's an investigatory
+  lead, not proof: worth a quick look by the ground team, same as an
+  unidentified BLE device is today. See [Spectrum scanner
+  notes](#spectrum-scanner-notes).
 
 ## Configuration
 
@@ -188,6 +204,17 @@ Environment variables (set in `docker-compose.yml`):
 | `GPSD_HOST` / `GPSD_PORT` | `127.0.0.1` / `2947` | Same as the primary scanner |
 | `SOURCE_UNIT_ID` | `ground-logger-ubertooth-01` | Kept distinct from the primary scanner's so both units' detections are separately attributable once merged |
 | `UBERTOOTH_DEVICE_INDEX` | unset (default device) | Only needed with more than one Ubertooth attached to the same host (`-U<n>`) |
+
+**scanner-spectrum**
+
+| Var | Default | Meaning |
+|---|---|---|
+| `DB_PATH` | `/data/detections.sqlite3` | Same SQLite file as the other scanners (shared via the `./data` volume) |
+| `GPSD_HOST` / `GPSD_PORT` | `127.0.0.1` / `2947` | Same as the other scanners |
+| `SOURCE_UNIT_ID` | `ground-logger-spectrum-01` | Kept distinct so this unit's hits are separately attributable once merged |
+| `SPECTRUM_CALIBRATION_S` | `10` | Seconds to sample each band at startup when establishing that flight's baseline |
+| `SPECTRUM_DWELL_S` | `5` | Seconds to sweep each band per pass once calibration is done |
+| `SPECTRUM_HIT_MARGIN_DB` | `10` | How far above a band's calibrated baseline a reading must be to count as a hit |
 
 **ground-station**
 
@@ -222,6 +249,35 @@ generator from the Ubertooth firmware source and `ubertooth_source.py` uses
 it as the actual validity gate, verified against the packet's raw on-air
 bytes rather than the tool's own flag.
 
+## Spectrum scanner notes
+
+`scanner-spectrum` doesn't decode a protocol the way the two BLE scanners
+do — it wraps `hackrf_sweep` (built from source in the container, same
+build-from-upstream rationale as the Ubertooth tools) and does simple
+energy-threshold detection across a fixed default list of bands: cellular
+(698–960 MHz and 1710–2200 MHz — a phone with no signal periodically
+transmits high-power bursts searching for a tower, often the single
+strongest signature available), the shared 2.4 GHz ISM band (WiFi/BLE/
+AirTag), and sub-GHz keyfobs (300–450 MHz, covering both 315 and
+433.92 MHz remotes). 5 GHz WiFi is intentionally left out of the default
+list — personal hotspots generally favor 2.4 GHz for range.
+
+On startup it samples each band for `SPECTRUM_CALIBRATION_S` seconds to
+establish that flight's own ambient-noise baseline before any drone motion
+is assumed to have started, then sweeps the bands forever, flagging any
+reading `SPECTRUM_HIT_MARGIN_DB` above its band's baseline as a hit. This
+is a per-flight baseline, not a continuously adapting one, by design — see
+`docs/superpowers/specs/2026-08-05-multiband-spectrum-scanner-design.md`
+for the full rationale, including why a single wideband panel antenna and
+simple threshold detection (no burst-shape classification) were chosen
+over the alternatives.
+
+A hit is not a decoded, identified device — it's "energy above baseline in
+a band commercial devices use," logged with band/frequency/power/GPS into
+its own `spectrum_hits` table (not merged into `detections`, since a hit
+has no persistent MAC-like identity to tag or track across sightings the
+way a BLE device does).
+
 ## Raspberry Pi deployment
 
 The image is built from `python:3.12-slim`, which publishes multi-arch
@@ -241,16 +297,21 @@ compose change).
 - No device-track history on the map yet — it only plots each device's
   latest position, not its path over time. The heatmap shows historical
   density but not direction of travel.
-- `privileged: true` on both scanners is broader than strictly necessary; it
-  can be narrowed once the host's D-Bus BlueZ policy is tuned (for
-  `scanner`) and the exact USB caps are pinned down (for
-  `scanner-ubertooth`). The ground-station service needs neither.
+- `privileged: true` on all three scanners is broader than strictly
+  necessary; it can be narrowed once the host's D-Bus BlueZ policy is tuned
+  (for `scanner`) and the exact USB caps are pinned down (for
+  `scanner-ubertooth` and `scanner-spectrum`). The ground-station service
+  needs neither.
 - Not yet deployed/tested on a Raspberry Pi — validated so far on an x86_64
   dev laptop only.
-- `scanner` and `scanner-ubertooth` both retry every 5s rather than exit if
-  their adapter is missing or disappears mid-run, which is what makes
-  unattended boot safe (see [Running](#running)) — but neither currently
-  distinguishes "adapter missing" from other startup failures in its retry
-  log line, so if scanning silently never starts, check the container logs
-  for what the underlying error actually is rather than assuming it's just
-  a missing adapter.
+- All three scanners retry every 5s rather than exit if their adapter is
+  missing or disappears mid-run, which is what makes unattended boot safe
+  (see [Running](#running)) — but none currently distinguishes "adapter
+  missing" from other startup failures in its retry log line, so if
+  scanning silently never starts, check the container logs for what the
+  underlying error actually is rather than assuming it's just a missing
+  adapter.
+- The spectrum scanner's per-band frequency ranges are US-centric defaults
+  (e.g. keyfob covers 315/433.92 MHz, cellular covers US LTE low/mid
+  bands) — deployments elsewhere may need different ranges for their local
+  spectrum allocation.
