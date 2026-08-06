@@ -15,7 +15,7 @@ design (baseline → wide-area sweep → cueing → close-in DF → confirmation
 | Primary BLE scanner | Sena UD100, or any BlueZ-recognized adapter | Validated end-to-end |
 | Secondary BLE scanner | Ubertooth One | Validated end-to-end, including independent CRC-24 verification (see [Ubertooth notes](#ubertooth-notes)) |
 | Multi-band spectrum scanner | HackRF One | Validated end-to-end (see [Spectrum scanner notes](#spectrum-scanner-notes)) |
-| RTL-SDR spectrum scanner | Any RTL2832U-based RTL-SDR dongle (R820T/R820T2 tuner) | Validated end-to-end (see [RTL-SDR notes](#rtl-sdr-notes)) |
+| RTL-SDR spectrum scanner | Any RTL2832U-based RTL-SDR dongle (R820T/R820T2 tuner) | Validated through real-hardware calibration on a Raspberry Pi (device detection, tuner ID, two-band baseline); a live-signal-to-map round trip specific to this backend hasn't been separately re-verified (see [RTL-SDR notes](#rtl-sdr-notes)) |
 | GPS | Any NMEA-capable USB/serial module, via gpsd | Validated end-to-end |
 
 The four scanners are independent and additive, not either/or: run any
@@ -388,8 +388,16 @@ software problem — this is a known sharp edge with SDR-class USB devices
   (for `scanner`) and the exact USB caps are pinned down (for
   `scanner-ubertooth`, `scanner-spectrum`, and `scanner-rtlsdr`). The ground-station service
   needs neither.
-- Not yet deployed/tested on a Raspberry Pi — validated so far on an x86_64
-  dev laptop only.
+- All four scanner services (plus ground-station) have run together in
+  Docker Compose on a Raspberry Pi 5. Of those, `scanner` (Sena UD100, real
+  BLE detections logged) and `scanner-rtlsdr` (real calibration against a
+  physical dongle) have been validated against real hardware specifically
+  on the Pi. `scanner-ubertooth` and `scanner-spectrum`'s real-hardware
+  validation (described elsewhere in this doc) happened on an x86_64 dev
+  laptop, not yet re-run against a physical Ubertooth/HackRF on the Pi
+  itself — expected to work unmodified (same multi-arch base images, see
+  [Raspberry Pi deployment](#raspberry-pi-deployment)) but not yet
+  confirmed there.
 - All four scanners retry every 5s rather than exit if their adapter is
   missing or disappears mid-run, which is what makes unattended boot safe
   (see [Running](#running)) — but none currently distinguishes "adapter
@@ -401,6 +409,20 @@ software problem — this is a known sharp edge with SDR-class USB devices
   tuners) means `scanner-rtlsdr` cannot cover the same band list as
   `scanner-spectrum` — see [RTL-SDR notes](#rtl-sdr-notes). This is a
   hardware limit, not a configuration gap.
+- A narrow, low-probability race in both `scanner-spectrum`'s and
+  `scanner-rtlsdr`'s subprocess-management code: if the coroutine
+  supervising `hackrf_sweep`/`rtl_power` is cancelled twice in quick
+  succession while it's already escalating from SIGTERM to SIGKILL (e.g.
+  during a specific window of service shutdown), the underlying asyncio
+  subprocess transport can end up in a state where a subsequent
+  `proc.kill()` call silently does nothing even though the real OS process
+  is still alive — leaking a process that (for `scanner-rtlsdr`
+  specifically) keeps the USB device claimed until it's manually killed or
+  the container is restarted. Needs two cancellations landing within the
+  same several-second window to trigger; not something a routine restart
+  or single Ctrl-C should hit. Tracked in `_run_rtl_power`'s docstring in
+  `services/scanner-rtlsdr/app/rtlsdr_source.py`, not chased further for
+  now.
 - The spectrum scanner's per-band frequency ranges are US-centric defaults
   (e.g. keyfob covers 315/433.92 MHz, cellular covers US LTE low/mid
   bands) — deployments elsewhere may need different ranges for their local

@@ -168,6 +168,19 @@ EOF
 
 ### Task 4: `rtl_power` subprocess wrapper, calibration, and sweep loop
 
+> **Superseded, post-implementation:** the exact code in this task's Step 3
+> (below) is what was originally written, but two review rounds found and
+> fixed real bugs in it — notably, `proc.communicate()` silently discards
+> already-collected readings when the surrounding `asyncio.wait_for`
+> cancels it during SIGTERM/SIGKILL escalation, and `-i str(duration_s)`
+> (unrounded) collapses to `-i 0` for sub-1-second durations. **Do not use
+> this task's Step 3 code as a reference for the actual shipped
+> implementation** — read the real, hardened `_run_rtl_power` in
+> `services/scanner-rtlsdr/app/rtlsdr_source.py` instead (see commits
+> `7c4c203`, `439d58c`, and the further budget-sizing fix after the final
+> whole-branch review). This plan is kept as a historical record of the
+> task breakdown, not as an up-to-date spec for this function.
+
 **Files:**
 - Modify: `services/scanner-rtlsdr/app/rtlsdr_source.py` (append)
 - Modify: `services/scanner-rtlsdr/tests/test_rtlsdr_source.py` (append)

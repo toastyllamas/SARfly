@@ -45,8 +45,10 @@ class SpectrumHitReading:
     baseline_dbm: float
 
 
-# hackrf_sweep CSV line: date, time, hz_low, hz_high, hz_bin_width,
-# num_samples, dB, dB, dB, ... (one dB reading per bin across the segment).
+# rtl_power CSV line: date, time, hz_low, hz_high, hz_bin_width,
+# num_samples, dB, dB, dB, ... (one dB reading per bin across the segment) --
+# verified identical in shape to hackrf_sweep's own CSV format (Component
+# F's spectrum_source.py), which is why this regex was copyable verbatim.
 _LINE_RE = re.compile(
     r"^[\d-]+,\s*[\d:.]+,\s*(?P<low>\d+),\s*(?P<high>\d+),\s*"
     r"(?P<binw>[\d.]+),\s*(?P<n>\d+),\s*(?P<rest>.+)$"
@@ -54,7 +56,7 @@ _LINE_RE = re.compile(
 
 
 def parse_sweep_line(line: str) -> tuple[int, int, float, list[float]] | None:
-    """Parse one hackrf_sweep CSV output line into
+    """Parse one rtl_power CSV output line into
     (hz_low, hz_high, hz_bin_width, db_values), or None if the line doesn't
     match (e.g. a stray log line interleaved on stdout).
     """
@@ -96,13 +98,16 @@ def _readings_in_band(readings: list[tuple[int, float]], band: Band) -> list[tup
     """Keep only readings whose frequency actually falls within this band's
     declared [low_hz, high_hz) range.
 
-    hackrf_sweep tunes in whole-MHz steps and _run_hackrf_sweep ceils the
-    high edge so a band's requested range is always fully covered (see its
-    docstring) -- which means it routinely returns readings past a band's
-    declared edge (e.g. the keyfob band's 450.0 MHz upper edge sweeping out
-    to ~459.5 MHz). Those out-of-range readings must be discarded here, not
-    folded into this band's baseline or hit detection under this band's
-    name.
+    Unlike hackrf_sweep (which routinely over-scans past a band's declared
+    edge -- see Component F's identical-named filter and its docstring),
+    rtl_power was verified NOT to do this for this module's two bands:
+    real sweeps produced exactly 150 bins for the 300-450 MHz keyfob range
+    and exactly 262 bins for the 698-960 MHz cellular_low range, matching
+    each band's declared width with no overshoot (Task 7). This filter is
+    kept anyway as a harmless safety net -- copied verbatim from Component
+    F along with the rest of the pure-logic half of this module -- rather
+    than removed on the assumption that no future rtl_power version or
+    argument combination will ever over-scan.
     """
     return [(freq, power) for freq, power in readings if band.low_hz <= freq < band.high_hz]
 
@@ -140,7 +145,7 @@ def detect_hits(
 
     fallback_baseline_dbm (that band's overall calibrated mean) is used
     only if a swept frequency wasn't seen during calibration -- shouldn't
-    normally happen since hackrf_sweep's bin layout is deterministic for a
+    normally happen since rtl_power's bin layout is deterministic for a
     fixed frequency-range, but this is a safety net rather than a KeyError.
     """
     hits = []
@@ -288,7 +293,29 @@ async def _run_rtl_power(
     # pass."), so this grace period is sized off duration_s itself rather
     # than a small fixed constant -- a short fixed grace would routinely
     # SIGKILL a healthy process still finishing its pass.
-    budget_s = duration_s + max(duration_s, 5.0)
+    #
+    # Real-hardware timing (Task 7) showed rtl_power's actual runtime does
+    # NOT track the requested -i value linearly or predictably across
+    # bands: keyfob measured ~10.9s at -i 8 and ~21.1s at -i 15 (roughly
+    # linear, ~1.46s of real time per requested second), while
+    # cellular_low measured ~18.5s at BOTH -i 8 and -i 15 (a
+    # hardware/USB-bus-imposed floor, independent of -i). The original
+    # `duration_s + max(duration_s, 5.0)` -- exactly 2x duration_s -- was
+    # found to leave only ~30% real margin at the shipped 25s/20s
+    # defaults once keyfob's linear trend is extrapolated (~35.7s/28.4s
+    # respectively), not the "comfortable margin" originally intended.
+    # `2*duration_s + 10` gives real margin at both the shipped defaults
+    # (50-60s budget vs. ~28-36s extrapolated worst case) AND stays cheap
+    # for the small duration_s values this module's own fast unit tests
+    # use (e.g. 0.1s -> 10.2s budget, not a large fixed floor that would
+    # make every escalation-path test slow regardless of duration_s).
+    # This is deliberately decoupled from duration_s scaling rather than
+    # just raising duration_s itself: the budget is a pure safety net
+    # (free on the happy path), whereas duration_s controls both
+    # calibration accuracy and the dwell loop's per-cycle band-revisit
+    # rate, which matters for a moving DF unit and shouldn't be inflated
+    # just to buy timeout margin.
+    budget_s = duration_s * 2 + 10.0
     try:
         await asyncio.wait_for(_read(), timeout=budget_s)
     except asyncio.TimeoutError:
