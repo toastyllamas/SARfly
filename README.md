@@ -15,9 +15,10 @@ design (baseline → wide-area sweep → cueing → close-in DF → confirmation
 | Primary BLE scanner | Sena UD100, or any BlueZ-recognized adapter | Validated end-to-end |
 | Secondary BLE scanner | Ubertooth One | Validated end-to-end, including independent CRC-24 verification (see [Ubertooth notes](#ubertooth-notes)) |
 | Multi-band spectrum scanner | HackRF One | Validated end-to-end (see [Spectrum scanner notes](#spectrum-scanner-notes)) |
+| RTL-SDR spectrum scanner | Any RTL2832U-based RTL-SDR dongle (R820T/R820T2 tuner) | Validated end-to-end (see [RTL-SDR notes](#rtl-sdr-notes)) |
 | GPS | Any NMEA-capable USB/serial module, via gpsd | Validated end-to-end |
 
-The three scanners are independent and additive, not either/or: run any
+The four scanners are independent and additive, not either/or: run any
 subset of them at once, and every detection/hit lands in the same shared
 log regardless of which radio saw it. None is required to be physically
 present for the stack to start — see [Running](#running).
@@ -30,6 +31,7 @@ present for the stack to start — see [Running](#running).
 - [Configuration](#configuration)
 - [Ubertooth notes](#ubertooth-notes)
 - [Spectrum scanner notes](#spectrum-scanner-notes)
+- [RTL-SDR notes](#rtl-sdr-notes)
 - [Raspberry Pi deployment](#raspberry-pi-deployment)
 - [Known limitations / not yet built](#known-limitations--not-yet-built)
 
@@ -88,6 +90,12 @@ dev laptop and on the Raspberry Pi target.
    `scanner-spectrum` runs `privileged: true` for raw USB access, and
    `hackrf_sweep` is built into that container's own image.
 
+6. **RTL-SDR dongle (optional)** — plug it in; confirm with `lsusb` (any
+   Realtek RTL2832U-based device, e.g. `0bda:2838`). Like the others, no
+   host-side driver setup needed for the Docker path: `scanner-rtlsdr` runs
+   `privileged: true` for raw USB access, and unlike Ubertooth/HackRF, its
+   `rtl-sdr` package comes straight from Debian (no from-source build).
+
 ## Running
 
 ```bash
@@ -95,12 +103,12 @@ cd ble-sar-df
 docker compose up --build
 ```
 
-This always starts all four services, regardless of which adapters are
-physically present — `scanner`, `scanner-ubertooth`, and `scanner-spectrum`
-each retry quietly in the background rather than blocking anything if their
-radio is missing (see [Known limitations](#known-limitations--not-yet-built)).
+This always starts all five services, regardless of which adapters are
+physically present — `scanner`, `scanner-ubertooth`, `scanner-spectrum`, and
+`scanner-rtlsdr` each retry quietly in the background rather than blocking
+anything if their radio is missing (see [Known limitations](#known-limitations--not-yet-built)).
 One command works unattended whether the host has any, all, or none of the
-UD100/Ubertooth/HackRF yet — the point of that design is a field SBC that
+UD100/Ubertooth/HackRF/RTL-SDR yet — the point of that design is a field SBC that
 boots this stack with no one there to pass a flag.
 
 Detections accumulate in `./data/detections.sqlite3` on the host (bind-mounted,
@@ -216,6 +224,17 @@ Environment variables (set in `docker-compose.yml`):
 | `SPECTRUM_DWELL_S` | `5` | Seconds to sweep each band per pass once calibration is done |
 | `SPECTRUM_HIT_MARGIN_DB` | `10` | How far above a reading's own frequency bin's calibrated baseline it must be to count as a hit |
 
+**scanner-rtlsdr**
+
+| Var | Default | Meaning |
+|---|---|---|
+| `DB_PATH` | `/data/detections.sqlite3` | Same SQLite file as the other scanners |
+| `GPSD_HOST` / `GPSD_PORT` | `127.0.0.1` / `2947` | Same as the other scanners |
+| `SOURCE_UNIT_ID` | `ground-logger-rtlsdr-01` | Kept distinct so this unit's hits are separately attributable |
+| `RTLSDR_CALIBRATION_S` | `25` | Seconds to sample each band at startup when establishing that flight's baseline (tuned from real-hardware timing in Task 7) |
+| `RTLSDR_DWELL_S` | `20` | Seconds to sweep each band per pass once calibration is done |
+| `RTLSDR_HIT_MARGIN_DB` | `10` | How far above a reading's own frequency bin's calibrated baseline it must be to count as a hit |
+
 **ground-station**
 
 | Var | Default | Meaning |
@@ -281,6 +300,34 @@ its own `spectrum_hits` table (not merged into `detections`, since a hit
 has no persistent MAC-like identity to tag or track across sightings the
 way a BLE device does).
 
+## RTL-SDR notes
+
+`scanner-rtlsdr` is Component F's detection philosophy (per-bin calibrated
+baseline, threshold detection, GPS-tagged hits into the shared
+`spectrum_hits` table) on cheaper, far more widely-owned hardware: an
+RTL-SDR dongle costs roughly a tenth of a HackRF One and a lot of people
+already have one from another hobby. The tradeoff is coverage — the common
+R820T/R820T2 tuner these dongles use only reaches ~24 MHz-1766 MHz
+(verified against the actual dongle used to build this), so it cannot see
+the 2.4 GHz ISM band at all and only reaches the bottom sliver of Component
+F's cellular-mid range. Rather than ship a same-named `cellular_mid`/
+`ism_2_4ghz` band covering a different, smaller range than Component F's
+own bands of the same name, `scanner-rtlsdr`'s default band list is scoped
+to the two bands (`keyfob`, `cellular_low`) this hardware can fully cover.
+
+It uses `rtl_power` (packaged directly by Debian, unlike Ubertooth/HackRF's
+from-source builds) rather than `hackrf_sweep`, which behaves differently
+in ways this service's code specifically accounts for: `rtl_power` exits
+on its own after each sweep interval rather than running forever, and
+batches its output rather than streaming it — see
+`docs/superpowers/specs/2026-08-06-rtlsdr-spectrum-scanner-design.md` for
+the verified details.
+
+Both `scanner-spectrum` and `scanner-rtlsdr` write into the same
+`spectrum_hits` table and render on the same ground-station map layer —
+run either, both, or neither; a hit from one is indistinguishable from the
+other in the UI except by `source_unit_id` in the underlying row.
+
 ## Raspberry Pi deployment
 
 The final-stage image for every service is built from `python:3.12-slim`,
@@ -336,20 +383,24 @@ software problem — this is a known sharp edge with SDR-class USB devices
   reset happens while connected. Low-probability and self-healing with one
   more click; a session/generation token on the reset broadcast would close
   it properly if it proves disruptive in practice.
-- `privileged: true` on all three scanners is broader than strictly
+- `privileged: true` on all four scanners is broader than strictly
   necessary; it can be narrowed once the host's D-Bus BlueZ policy is tuned
   (for `scanner`) and the exact USB caps are pinned down (for
-  `scanner-ubertooth` and `scanner-spectrum`). The ground-station service
+  `scanner-ubertooth`, `scanner-spectrum`, and `scanner-rtlsdr`). The ground-station service
   needs neither.
 - Not yet deployed/tested on a Raspberry Pi — validated so far on an x86_64
   dev laptop only.
-- All three scanners retry every 5s rather than exit if their adapter is
+- All four scanners retry every 5s rather than exit if their adapter is
   missing or disappears mid-run, which is what makes unattended boot safe
   (see [Running](#running)) — but none currently distinguishes "adapter
   missing" from other startup failures in its retry log line, so if
   scanning silently never starts, check the container logs for what the
   underlying error actually is rather than assuming it's just a missing
   adapter.
+- The RTL-SDR's real tunable range (~24 MHz-1766 MHz, common R820T/R820T2
+  tuners) means `scanner-rtlsdr` cannot cover the same band list as
+  `scanner-spectrum` — see [RTL-SDR notes](#rtl-sdr-notes). This is a
+  hardware limit, not a configuration gap.
 - The spectrum scanner's per-band frequency ranges are US-centric defaults
   (e.g. keyfob covers 315/433.92 MHz, cellular covers US LTE low/mid
   bands) — deployments elsewhere may need different ranges for their local

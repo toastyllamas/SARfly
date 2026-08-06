@@ -170,6 +170,26 @@ cueing step as Components A/B/D. Implemented as its own service
 for the full design, including the default band list and why 5 GHz WiFi
 and burst-shape classification were left out for now.
 
+### G. RTL-SDR Spectrum Scanner (cheap-hardware variant of F)
+
+Same detection philosophy as Component F (per-bin calibrated baseline,
+GPS-tagged energy-threshold hits into the shared `spectrum_hits` table),
+built on an RTL-SDR dongle instead of a HackRF One -- a ~$25-30 part a lot
+of SAR volunteers already own, versus the HackRF's ~$300. The real
+tradeoff, verified against hardware rather than assumed: the common
+R820T/R820T2 tuner these dongles use only reaches ~24 MHz-1766 MHz, so its
+default band list (`keyfob`, `cellular_low`) is a subset of Component F's
+four bands -- it cannot reach the 2.4 GHz ISM band at all. Implemented as
+its own service (`services/scanner-rtlsdr/`), reusing Component F's
+already-hardened pure detection logic by duplication (this repo's
+established cross-service reuse pattern) and writing into the *same*
+`spectrum_hits` table with its own `SOURCE_UNIT_ID` -- no new
+ground-station code was needed. See
+`docs/superpowers/specs/2026-08-06-rtlsdr-spectrum-scanner-design.md` for
+the full design, including the verified differences between `rtl_power`
+and `hackrf_sweep`'s process lifecycle that its subprocess wrapper
+accounts for.
+
 ## 3. Data Model
 
 Every BLE detection (Components A/B/D) is one record, same schema across
@@ -204,6 +224,7 @@ energy detection) is ever built, revisit whether it shares Component F's
 | SDR, close-in DF (D, optional v2) | HackRF One or RTL-SDR v3/v4 | Single-channel RSSI is enough here; only if BLE-native RSSI-peak DF proves insufficient |
 | SDR, wide-area energy detector (E, optional v2) | LimeSDR Mini 2.0 or bladeRF 2.0 micro | Needs ≥80 MHz instantaneous bandwidth to see the full ISM band in one capture — HackRF/RTL-SDR are too narrow for this role |
 | SDR, multi-band spectrum scanner (F) | HackRF One | Built and validated — see `services/scanner-spectrum/`. 20 MHz instantaneous bandwidth is enough here since it sweeps disjoint narrow bands sequentially rather than capturing the whole ISM band at once |
+| SDR, RTL-SDR variant of the spectrum scanner (G) | Any RTL2832U + R820T/R820T2 dongle | Built and validated — see `services/scanner-rtlsdr/`. Cheaper, more widely-owned alternative to Component F's HackRF, at the cost of tuner range (~24MHz-1766MHz) |
 | GPS | u-blox NEO-M8N/M9N | Or reuse flight controller GPS via MAVLink on the drone unit |
 | SBC | Raspberry Pi 4/5 (ground station), Pi Zero 2 W if a drone-side SBC is ever needed | MCU-only is preferred on the drone for weight/power; add an SBC there only if you need onboard clustering/mapping mid-flight |
 | Telemetry downlink | Reuse existing drone telemetry/companion-computer link if present; otherwise LoRa for range at low bandwidth (fine — detection events are tiny) | Avoid a second WiFi radio on the drone; it's just more self-interference |
@@ -256,3 +277,6 @@ interrogation/paging rather than passive advertisement scanning.
    HackRF already in hand. See
    `docs/superpowers/plans/2026-08-05-multiband-spectrum-scanner.md` for
    the implementation plan.
+7. RTL-SDR spectrum scanner (G) -- independent of (F), same detection
+   logic on cheaper hardware. See
+   `docs/superpowers/plans/2026-08-06-rtlsdr-spectrum-scanner.md`.
