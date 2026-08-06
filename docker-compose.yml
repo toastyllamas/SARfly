@@ -86,6 +86,33 @@ services:
       SPECTRUM_HIT_MARGIN_DB: "10"
       LOG_LEVEL: INFO
 
+  # Fourth, independent capture unit -- an RTL-SDR dongle doing the same
+  # kind of wide-area energy detection as scanner-spectrum, on cheaper and
+  # much more widely-owned hardware, scoped to the two bands (keyfob,
+  # cellular_low) its R820T tuner can actually and fully cover. See
+  # docs/superpowers/specs/2026-08-06-rtlsdr-spectrum-scanner-design.md.
+  # Writes into the same shared detections.sqlite3's spectrum_hits table,
+  # tagged with its own SOURCE_UNIT_ID. Starts unconditionally like the
+  # other scanners -- if the RTL-SDR isn't attached, rtlsdr_source.py logs
+  # a warning and retries every 5s forever.
+  scanner-rtlsdr:
+    build: ./services/scanner-rtlsdr
+    image: ble-sar-df-scanner-rtlsdr:local
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    volumes:
+      - ./data:/data
+    environment:
+      DB_PATH: /data/detections.sqlite3
+      GPSD_HOST: 127.0.0.1
+      GPSD_PORT: "2947"
+      SOURCE_UNIT_ID: ground-logger-rtlsdr-01
+      RTLSDR_CALIBRATION_S: "15"
+      RTLSDR_DWELL_S: "8"
+      RTLSDR_HIT_MARGIN_DB: "10"
+      LOG_LEVEL: INFO
+
   ground-station:
     build: ./services/ground_station
     image: ble-sar-df-ground-station:local
@@ -93,6 +120,7 @@ services:
     depends_on:
       - scanner
       - scanner-spectrum
+      - scanner-rtlsdr
     # No host networking or privileges needed here -- this service only
     # reads/writes the shared SQLite file and serves plain HTTP/WebSocket.
     ports:
