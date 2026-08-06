@@ -108,8 +108,8 @@ services:
       GPSD_HOST: 127.0.0.1
       GPSD_PORT: "2947"
       SOURCE_UNIT_ID: ground-logger-rtlsdr-01
-      RTLSDR_CALIBRATION_S: "15"
-      RTLSDR_DWELL_S: "8"
+      RTLSDR_CALIBRATION_S: "25"
+      RTLSDR_DWELL_S: "20"
       RTLSDR_HIT_MARGIN_DB: "10"
       LOG_LEVEL: INFO
 

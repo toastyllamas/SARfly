@@ -160,8 +160,17 @@ import time
 logger = logging.getLogger(__name__)
 
 DEFAULT_MARGIN_DB = 10.0
-DEFAULT_CALIBRATION_S = 15.0
-DEFAULT_DWELL_S = 8.0
+# Verified against real hardware (Task 7): rtl_power routinely overshoots
+# the requested -i interval -- a real cellular_low sweep (262-283 1MHz
+# hops) took 18.5-21.1s real time against -i 8/-i 15 alike, not the
+# requested duration. These defaults are sized with real margin above
+# that observed worst case, not the nominal "-i" value, so a normal,
+# healthy sweep never nears the SIGTERM escalation path in
+# _run_rtl_power (which is safe either way, but wastes a whole sweep's
+# worth of data if triggered on a healthy-but-slow process -- see that
+# function's docstring).
+DEFAULT_CALIBRATION_S = 25.0
+DEFAULT_DWELL_S = 20.0
 
 
 async def _log_stderr(stream: asyncio.StreamReader | None, captured: list[str]) -> None:
