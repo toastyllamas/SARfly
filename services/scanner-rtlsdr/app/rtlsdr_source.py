@@ -164,6 +164,15 @@ DEFAULT_CALIBRATION_S = 15.0
 DEFAULT_DWELL_S = 8.0
 
 
+async def _log_stderr(stream: asyncio.StreamReader | None, captured: list[str]) -> None:
+    if stream is None:
+        return
+    async for raw_line in stream:
+        text = raw_line.decode(errors="replace").rstrip("\n")
+        captured.append(text)
+        logger.warning("rtl_power: %s", text)
+
+
 async def _run_rtl_power(
     low_hz: int, high_hz: int, duration_s: float, bin_hz: int = 1_000_000
 ) -> list[tuple[int, float]]:
@@ -179,15 +188,65 @@ async def _run_rtl_power(
     duration_s could plausibly allow" is this function's failure signal,
     not "exited at all."
 
-    rtl_power does not stream output incrementally -- verified: stdout
-    stays empty until the whole pass completes -- so this collects
-    everything via proc.communicate() rather than reading line-by-line the
-    way hackrf_sweep's wrapper does.
+    rtl_power's real -i flag rounds to an integer (verified against
+    hardware) -- round duration_s rather than passing it through verbatim,
+    so a fractional or sub-1-second duration_s doesn't silently collapse
+    to "-i 0".
+
+    Two Critical bugs were found (and fixed here) in an earlier version of
+    this function that collected output via a single `await
+    proc.communicate()` call:
+
+    1. Readings not surviving cancellation: `communicate()` is atomic --
+       if the surrounding `asyncio.wait_for` times out and cancels it,
+       everything communicate() had already read from the pipe is thrown
+       away, not returned. rtl_power was verified to delay honoring
+       SIGTERM until it finishes its current scan pass, so hitting the
+       escalation path is routine, not rare -- meaning a normal,
+       slightly-slow-to-exit sweep could come back with zero readings
+       instead of the ones it actually produced. Fixed by appending each
+       parsed line to `readings` (an accumulator outside the read
+       coroutine) as it's read via `async for raw_line in proc.stdout`,
+       the same shape _run_hackrf_sweep uses -- only whatever is still
+       unread in the OS pipe buffer at the moment of cancellation is ever
+       lost, which is unavoidable regardless of read strategy. rtl_power
+       batching all its output right before exiting (rather than
+       streaming progressively) doesn't require a different reading
+       mechanism; `async for` over the stream works the same either way.
+
+    2. Orphaned subprocess on outer cancellation: there was no
+       try/finally wrapping the process lifecycle, so if the coroutine
+       running this function was itself cancelled (e.g. service
+       shutdown), the child rtl_power process was never terminated --
+       and worse, the orphan keeps the RTL-SDR USB device claimed, so a
+       restarted scanner fails to reopen it. Fixed by putting the
+       terminate/kill escalation inside the `finally` block itself
+       (guarded by `proc.returncode is None`, i.e. still running) rather
+       than inside `except asyncio.TimeoutError` -- a genuine outer
+       cancellation raises CancelledError, not TimeoutError, so escalation
+       logic living only in the except clause would never run on outer
+       cancellation and the process would still leak. Python guarantees
+       `finally` runs regardless of which exception (or none) triggered
+       it, so putting cleanup there closes that gap for both the
+       "rtl_power itself is slow to exit" case and the "our own caller
+       got cancelled" case.
     """
-    args = ["rtl_power", "-f", f"{low_hz}:{high_hz}:{bin_hz}", "-i", str(duration_s), "-1", "-"]
+    args = [
+        "rtl_power", "-f", f"{low_hz}:{high_hz}:{bin_hz}",
+        "-i", str(max(1, round(duration_s))), "-1", "-",
+    ]
+
+    readings: list[tuple[int, float]] = []
+    stderr_lines: list[str] = []
     proc = await asyncio.create_subprocess_exec(
         *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
+    stderr_task = asyncio.create_task(_log_stderr(proc.stderr, stderr_lines))
+
+    async def _read() -> None:
+        assert proc.stdout is not None
+        async for raw_line in proc.stdout:
+            readings.extend(_readings_from_line(raw_line.decode(errors="replace")))
 
     start = time.monotonic()
     # rtl_power was verified to delay exiting after SIGTERM until it
@@ -197,31 +256,53 @@ async def _run_rtl_power(
     # SIGKILL a healthy process still finishing its pass.
     budget_s = duration_s + max(duration_s, 5.0)
     try:
-        stdout_data, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=budget_s)
+        await asyncio.wait_for(_read(), timeout=budget_s)
     except asyncio.TimeoutError:
-        proc.terminate()
-        try:
-            stdout_data, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=duration_s + 5.0)
-        except asyncio.TimeoutError:
-            proc.kill()
+        pass
+    finally:
+        stderr_task.cancel()
+        # Escalation lives in `finally`, not in the `except
+        # asyncio.TimeoutError` clause above, so it still runs if THIS
+        # coroutine is the one being cancelled (outer shutdown) rather
+        # than rtl_power merely running long -- CancelledError is not a
+        # TimeoutError, so escalation logic in the except clause alone
+        # would silently skip cleanup and orphan the process (Critical 2).
+        # Guarding on proc.returncode is None means a process that already
+        # exited on its own (the normal happy path) is left alone here.
+        if proc.returncode is None:
+            proc.terminate()
             try:
-                stdout_data, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                # proc.wait() waits for the actual process exit status,
+                # not for the stdout pipe to reach EOF -- unlike
+                # communicate(), it can't misdiagnose a process that
+                # already died but has a grandchild still holding the
+                # write end of the pipe open.
+                await asyncio.wait_for(proc.wait(), timeout=duration_s + 5.0)
             except asyncio.TimeoutError:
-                raise OSError(
-                    f"rtl_power (pid={proc.pid}) did not exit even after SIGKILL "
-                    f"while sweeping {low_hz}:{high_hz} Hz"
-                ) from None
+                proc.kill()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    raise OSError(
+                        f"rtl_power (pid={proc.pid}) did not exit even after SIGKILL "
+                        f"while sweeping {low_hz}:{high_hz} Hz"
+                    ) from None
 
     elapsed = time.monotonic() - start
-    readings: list[tuple[int, float]] = []
-    for raw_line in stdout_data.decode(errors="replace").splitlines():
-        readings.extend(_readings_from_line(raw_line))
 
     # A real device-gone failure was verified to fail in ~58ms; a real
     # sweep, even a short one, takes a meaningful fraction of duration_s.
     # 50% margin distinguishes "fast-failed" from "legitimately quick."
-    if proc.returncode not in (0, None) and elapsed < duration_s * 0.5:
-        stderr_text = stderr_data.decode(errors="replace").strip() or "(no stderr output captured)"
+    # A late failure (past that 50% mark) that still produced usable
+    # readings is NOT treated as a failure -- better to use partial real
+    # data than discard it and retry from scratch -- but a late failure
+    # that produced zero in-range readings is no different from an early
+    # one, so it must still raise rather than being silently treated as a
+    # successful empty sweep (which would otherwise spin stream_hits's
+    # "zero in-band readings" calibration guard forever, or leave the
+    # dwell loop silently deaf).
+    if proc.returncode not in (0, None) and (elapsed < duration_s * 0.5 or not readings):
+        stderr_text = " | ".join(stderr_lines) or "(no stderr output captured)"
         raise OSError(
             f"rtl_power exited early (returncode={proc.returncode}, after "
             f"{elapsed:.2f}s of a {duration_s:.0f}s window) while sweeping "
