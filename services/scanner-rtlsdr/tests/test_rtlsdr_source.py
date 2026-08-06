@@ -376,6 +376,59 @@ def test_run_rtl_power_terminates_process_on_outer_cancellation(tmp_path, monkey
 
 
 @pytest.fixture
+def fake_rtl_power_ignores_sigterm_no_output(tmp_path, monkeypatch):
+    """Ignores SIGTERM and never emits any output -- models a process
+    that is simply slow (not failed) and gets killed by our own timeout
+    before it ever produces a reading, as distinct from
+    fake_rtl_power_late_failure_no_readings (which models a real device
+    failure: exits on its own, nonzero, without our intervention).
+    """
+    script = tmp_path / "rtl_power"
+    script.write_text(
+        "#!/bin/sh\n"
+        "trap '' TERM\n"
+        "while true; do sleep 0.05; done\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    return script
+
+
+def test_run_rtl_power_does_not_blame_device_when_we_killed_a_slow_process(
+    fake_rtl_power_ignores_sigterm_no_output,
+):
+    """Regression test for a bug found in review: using proc.returncode
+    (read AFTER our own terminate()/kill()) instead of the exit code
+    captured the moment the read loop ended meant our own SIGTERM/SIGKILL
+    (-15/-9) could be mistaken for a device failure signal, producing a
+    self-contradictory "device likely unavailable" exception on a process
+    that was simply still running (None) when our own timeout fired --
+    not something rtl_power itself ever reported as a failure.
+
+    With the exit code captured before escalation (matching
+    _run_hackrf_sweep's identical pattern), a process that's still
+    running (None) at that capture point is not attributable to a device
+    failure -- it's genuinely ambiguous whether it was failing or just
+    slow -- so this returns quietly with an empty reading list rather
+    than raising. stream_hits's own calibration-retry-on-empty-readings
+    guard, and the dwell loop's "no hits from an empty reading list"
+    behavior, already handle an empty result correctly without needing
+    an exception raised here.
+
+    Verified empirically: reverting the exited_returncode capture (using
+    proc.returncode read AFTER escalation instead) makes this test fail
+    with a raised OSError mentioning a returncode of -9.
+    """
+    from rtlsdr_source import _run_rtl_power
+
+    async def run():
+        return await _run_rtl_power(433_000_000, 434_000_000, duration_s=0.1)
+
+    readings = asyncio.run(asyncio.wait_for(run(), timeout=20))
+    assert readings == []
+
+
+@pytest.fixture
 def fake_rtl_power_late_failure_no_readings(tmp_path, monkeypatch):
     """Runs close to the full requested duration (not the fast
     device-gone path), writes an error to stderr, then exits nonzero

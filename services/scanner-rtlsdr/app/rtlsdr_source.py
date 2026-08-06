@@ -230,6 +230,31 @@ async def _run_rtl_power(
        it, so putting cleanup there closes that gap for both the
        "rtl_power itself is slow to exit" case and the "our own caller
        got cancelled" case.
+
+    Two more were found in review of the fix above:
+
+    3. The exit code used for the failure check must be captured the
+       moment the read loop ends, before we potentially terminate/kill a
+       still-running (healthy, just slow) process below -- otherwise our
+       own SIGTERM/SIGKILL (-15/-9) becomes the "failure" signal, on a
+       device that was never actually unavailable. Matches
+       _run_hackrf_sweep's identical `exited_returncode` capture.
+
+    4. A second cancellation arriving while we're waiting out the SIGTERM
+       grace period should not skip straight past `proc.kill()` -- that
+       would leave a SIGTERM-ignoring process still holding the USB
+       device, the exact harm bug 2 above was about. A best-effort guard
+       is in place below (catch CancelledError here too, kill, then
+       re-raise), but empirically this specific double-cancellation race
+       is NOT fully closed by it: asyncio's subprocess transport can end
+       up in a state, after the first cancelled wait_for(proc.wait()),
+       where a subsequent proc.kill() silently does nothing even though
+       the real OS process is still alive. This is a narrow, low-probability
+       edge case (needs two cancellations landing within the same ~5s+
+       window during shutdown) inherited from the same underlying shape
+       in Component F's _run_hackrf_sweep, not something unique to this
+       function -- tracked as a known limitation rather than chased
+       further here; see README's Known limitations.
     """
     args = [
         "rtl_power", "-f", f"{low_hz}:{high_hz}:{bin_hz}",
@@ -261,6 +286,14 @@ async def _run_rtl_power(
         pass
     finally:
         stderr_task.cancel()
+        # Capture the exit code as it stood the moment the read loop
+        # ended, before we potentially force-kill a still-running
+        # (healthy, just slow) process below -- terminate()/kill() always
+        # leave a non-zero/negative returncode (-15/-9), which must not be
+        # mistaken for a failure signal on a device that was never
+        # actually unavailable. Matches _run_hackrf_sweep's identical
+        # capture, for the identical reason.
+        exited_returncode = proc.returncode
         # Escalation lives in `finally`, not in the `except
         # asyncio.TimeoutError` clause above, so it still runs if THIS
         # coroutine is the one being cancelled (outer shutdown) rather
@@ -287,6 +320,14 @@ async def _run_rtl_power(
                         f"rtl_power (pid={proc.pid}) did not exit even after SIGKILL "
                         f"while sweeping {low_hz}:{high_hz} Hz"
                     ) from None
+            except asyncio.CancelledError:
+                # A second cancellation landing while we're waiting out
+                # the SIGTERM grace period must not skip straight past
+                # proc.kill() and orphan a still-SIGTERM-ignoring process
+                # (rtl_power's documented, routine behavior) -- kill it
+                # before letting the cancellation propagate.
+                proc.kill()
+                raise
 
     elapsed = time.monotonic() - start
 
@@ -301,10 +342,10 @@ async def _run_rtl_power(
     # successful empty sweep (which would otherwise spin stream_hits's
     # "zero in-band readings" calibration guard forever, or leave the
     # dwell loop silently deaf).
-    if proc.returncode not in (0, None) and (elapsed < duration_s * 0.5 or not readings):
+    if exited_returncode not in (0, None) and (elapsed < duration_s * 0.5 or not readings):
         stderr_text = " | ".join(stderr_lines) or "(no stderr output captured)"
         raise OSError(
-            f"rtl_power exited early (returncode={proc.returncode}, after "
+            f"rtl_power exited early (returncode={exited_returncode}, after "
             f"{elapsed:.2f}s of a {duration_s:.0f}s window) while sweeping "
             f"{low_hz}:{high_hz} Hz -- device likely unavailable: {stderr_text}"
         )
