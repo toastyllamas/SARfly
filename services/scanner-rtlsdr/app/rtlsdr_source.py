@@ -151,3 +151,141 @@ def detect_hits(
                 SpectrumHitReading(band=band_name, freq_hz=freq, power_dbm=power, baseline_dbm=baseline_dbm)
             )
     return hits
+
+
+import asyncio
+import logging
+import time
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_MARGIN_DB = 10.0
+DEFAULT_CALIBRATION_S = 15.0
+DEFAULT_DWELL_S = 8.0
+
+
+async def _run_rtl_power(
+    low_hz: int, high_hz: int, duration_s: float, bin_hz: int = 1_000_000
+) -> list[tuple[int, float]]:
+    """Run one rtl_power single-shot sweep over [low_hz, high_hz) for one
+    ~duration_s reporting interval and return every (freq_hz, power_dbm)
+    reading collected.
+
+    Unlike hackrf_sweep (which never exits on its own while sweeping),
+    rtl_power's -1 (single-shot) mode is *designed* to exit on its own
+    after one -i-second interval -- verified against real hardware. A
+    genuine device failure was verified to fail almost instantly (tens of
+    ms, exit code 1, zero stdout) by contrast, so "exited far sooner than
+    duration_s could plausibly allow" is this function's failure signal,
+    not "exited at all."
+
+    rtl_power does not stream output incrementally -- verified: stdout
+    stays empty until the whole pass completes -- so this collects
+    everything via proc.communicate() rather than reading line-by-line the
+    way hackrf_sweep's wrapper does.
+    """
+    args = ["rtl_power", "-f", f"{low_hz}:{high_hz}:{bin_hz}", "-i", str(duration_s), "-1", "-"]
+    proc = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+
+    start = time.monotonic()
+    # rtl_power was verified to delay exiting after SIGTERM until it
+    # finishes its current scan pass ("Signal caught, finishing scan
+    # pass."), so this grace period is sized off duration_s itself rather
+    # than a small fixed constant -- a short fixed grace would routinely
+    # SIGKILL a healthy process still finishing its pass.
+    budget_s = duration_s + max(duration_s, 5.0)
+    try:
+        stdout_data, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=budget_s)
+    except asyncio.TimeoutError:
+        proc.terminate()
+        try:
+            stdout_data, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=duration_s + 5.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            try:
+                stdout_data, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            except asyncio.TimeoutError:
+                raise OSError(
+                    f"rtl_power (pid={proc.pid}) did not exit even after SIGKILL "
+                    f"while sweeping {low_hz}:{high_hz} Hz"
+                ) from None
+
+    elapsed = time.monotonic() - start
+    readings: list[tuple[int, float]] = []
+    for raw_line in stdout_data.decode(errors="replace").splitlines():
+        readings.extend(_readings_from_line(raw_line))
+
+    # A real device-gone failure was verified to fail in ~58ms; a real
+    # sweep, even a short one, takes a meaningful fraction of duration_s.
+    # 50% margin distinguishes "fast-failed" from "legitimately quick."
+    if proc.returncode not in (0, None) and elapsed < duration_s * 0.5:
+        stderr_text = stderr_data.decode(errors="replace").strip() or "(no stderr output captured)"
+        raise OSError(
+            f"rtl_power exited early (returncode={proc.returncode}, after "
+            f"{elapsed:.2f}s of a {duration_s:.0f}s window) while sweeping "
+            f"{low_hz}:{high_hz} Hz -- device likely unavailable: {stderr_text}"
+        )
+
+    return readings
+
+
+async def _sweep_band(band: Band, duration_s: float) -> list[tuple[int, float]]:
+    """Run _run_rtl_power for one band, retrying forever every 5s if the
+    binary is missing or the sweep fails -- same reconnect philosophy as
+    GpsClient.run() and Component F's _sweep_band.
+    """
+    while True:
+        try:
+            return await _run_rtl_power(band.low_hz, band.high_hz, duration_s)
+        except FileNotFoundError:
+            logger.error("rtl_power not found on PATH; is the rtl-sdr package installed?")
+            await asyncio.sleep(5)
+        except OSError as exc:
+            logger.warning("rtl_power failed for band %s (%s); retrying in 5s", band.name, exc)
+            await asyncio.sleep(5)
+
+
+async def stream_hits(
+    margin_db: float = DEFAULT_MARGIN_DB,
+    calibration_s: float = DEFAULT_CALIBRATION_S,
+    dwell_s: float = DEFAULT_DWELL_S,
+    bands: list[Band] | None = None,
+):
+    """Calibrate a per-frequency-bin baseline across all bands once, then
+    sweep them forever, yielding SpectrumHitReading for every in-band
+    reading that exceeds its own bin's calibrated baseline + margin_db.
+
+    Mirrors Component F's already-hardened stream_hits (per-bin baseline,
+    out-of-band filtering, retry-forever on zero-reading calibration) --
+    see docs/superpowers/specs/2026-08-06-rtlsdr-spectrum-scanner-design.md
+    Section 5.
+    """
+    active_bands = bands if bands is not None else DEFAULT_BANDS
+
+    baseline_by_freq: dict[str, dict[int, float]] = {}
+    fallback_baseline: dict[str, float] = {}
+    logger.info("calibrating baseline for %d bands (%.0fs each)...", len(active_bands), calibration_s)
+    for band in active_bands:
+        while True:
+            readings = _readings_in_band(await _sweep_band(band, calibration_s), band)
+            if readings:
+                break
+            logger.warning("zero in-band readings calibrating %s; retrying in 5s", band.name)
+            await asyncio.sleep(5)
+        powers = [p for _, p in readings]
+        baseline_by_freq[band.name] = average_power_by_freq(readings)
+        fallback_baseline[band.name] = average_power(powers)
+        logger.info(
+            "baseline[%s] = %.1f dBm avg across %d bins (%d samples)",
+            band.name, fallback_baseline[band.name], len(baseline_by_freq[band.name]), len(powers),
+        )
+
+    while True:
+        for band in active_bands:
+            readings = _readings_in_band(await _sweep_band(band, dwell_s), band)
+            for hit in detect_hits(
+                readings, band.name, baseline_by_freq[band.name], margin_db, fallback_baseline[band.name]
+            ):
+                yield hit

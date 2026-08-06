@@ -162,3 +162,87 @@ def test_readings_in_band_filters_out_of_range_frequencies():
         (310_000_000, -50.0),
         (449_999_999, -55.0),
     ]
+
+
+import asyncio
+import os
+
+import pytest
+
+
+@pytest.fixture
+def fake_rtl_power(tmp_path, monkeypatch):
+    """Fakes rtl_power's *actual* verified behavior: batches all output at
+    once right before exiting (not streamed), and exits successfully on its
+    own after roughly its -i interval -- unlike hackrf_sweep, which never
+    exits on its own while sweeping.
+    """
+    script = tmp_path / "rtl_power"
+    script.write_text(
+        "#!/bin/sh\n"
+        "sleep 0.05\n"
+        'echo "2026-08-05, 20:11:31, 433000000, 434000000, 7812.50, 71488, -23.61, -24.44"\n'
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    return script
+
+
+@pytest.fixture
+def fake_rtl_power_device_gone(tmp_path, monkeypatch):
+    """Real rtl_power was verified to fail this way when the device index
+    doesn't exist: exit code 1, near-instant (tens of ms), zero stdout,
+    a "No matching devices found." stderr line.
+    """
+    script = tmp_path / "rtl_power"
+    script.write_text(
+        "#!/bin/sh\n"
+        "echo 'No matching devices found.' >&2\n"
+        "exit 1\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    return script
+
+
+def test_run_rtl_power_collects_readings(fake_rtl_power):
+    from rtlsdr_source import _run_rtl_power
+
+    readings = asyncio.run(_run_rtl_power(433_000_000, 434_000_000, duration_s=1.0))
+    assert (433003906, -23.61) in readings or any(f == 433003906 for f, _ in readings)
+
+
+def test_run_rtl_power_raises_when_binary_missing(tmp_path, monkeypatch):
+    from rtlsdr_source import _run_rtl_power
+
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(_run_rtl_power(433_000_000, 434_000_000, duration_s=1.0))
+
+
+def test_run_rtl_power_raises_when_device_gone(fake_rtl_power_device_gone):
+    from rtlsdr_source import _run_rtl_power
+
+    with pytest.raises(OSError, match="device likely unavailable"):
+        asyncio.run(_run_rtl_power(433_000_000, 434_000_000, duration_s=2.0))
+
+
+def test_run_rtl_power_does_not_misflag_a_real_full_duration_sweep(tmp_path, monkeypatch):
+    """A real sweep that legitimately takes close to the full requested
+    duration (not the fast device-gone path) must not be treated as a
+    failure just because it exited "before an external timeout" -- that
+    was hackrf_sweep's failure signal, not rtl_power's.
+    """
+    from rtlsdr_source import _run_rtl_power
+
+    script = tmp_path / "rtl_power"
+    script.write_text(
+        "#!/bin/sh\n"
+        "sleep 0.3\n"
+        'echo "2026-08-05, 20:11:31, 433000000, 434000000, 7812.50, 1, -20.0"\n'
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+
+    readings = asyncio.run(_run_rtl_power(433_000_000, 434_000_000, duration_s=0.3))
+    assert readings  # did not raise, and collected the reading
