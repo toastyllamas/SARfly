@@ -159,18 +159,20 @@ Open **http://localhost:8080** for the ground-station UI.
   fingerprint logic lives in `services/ground_station/app/vendor_id.py` as
   an extensible list, so adding Apple Watch/Fitbit/Suunto/Coros/etc. later
   is a small addition, not a rewrite.
-- **OUI vendor lookup (low confidence)**: when nothing above matches, the
-  MAC's first three octets are checked against IEEE's public OUI registry
-  (bundled at `services/ground_station/app/data/oui.csv`, ~40k assignments,
-  so this works fully offline) to at least name a hardware manufacturer --
-  "Espressif Inc." rather than nothing. Skipped entirely for locally
-  administered (randomized) MACs, since those prefixes were never actually
-  IEEE-assigned and a lookup would risk a coincidentally-real-looking but
-  meaningless name; see `services/ground_station/app/oui_lookup.py`. This
-  is the weakest of the three confidence tiers (shown more faintly in the
-  UI) and applies to WiFi station detections (see below) as well as BLE
-  ones, since it only needs a MAC, not protocol-specific advertisement
-  data. To refresh the bundled registry later: `curl -o oui_raw.csv
+- **OUI vendor lookup (low confidence, BLE only)**: when nothing above
+  matches, a BLE detection's MAC is checked against IEEE's public OUI
+  registry (bundled at `services/ground_station/app/data/oui.csv`, ~40k
+  assignments, so this works fully offline) to at least name a hardware
+  manufacturer -- "Espressif Inc." rather than nothing. Skipped entirely
+  for locally administered (randomized) MACs, since those prefixes were
+  never actually IEEE-assigned and a lookup would risk a
+  coincidentally-real-looking but meaningless name; see
+  `services/ground_station/app/oui_lookup.py`. Also skipped for WiFi
+  station detections (see below) even though the lookup itself would work
+  the same way (it only needs a MAC) -- every nearby AP/phone picking up a
+  badge crowded the device list with low-value noise in practice, so this
+  is deliberately BLE-only despite being technically source-agnostic. To
+  refresh the bundled registry later: `curl -o oui_raw.csv
   https://standards-oui.ieee.org/oui/oui.csv`, then re-derive the two-column
   `oui_prefix,vendor` CSV from its `Assignment`/`Organization Name` fields.
 - Clicking a row (or focusing its label field) **locks the view** — a

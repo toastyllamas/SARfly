@@ -56,3 +56,18 @@ def test_classify_prefers_specific_fingerprint_over_oui():
 def test_classify_returns_none_for_randomized_mac_with_no_other_signal():
     guess = classify("12:34:56:78:9a:bc", device_name=None, adv_data_json=None)
     assert guess is None
+
+
+def test_classify_skips_oui_fallback_for_wifi_frames():
+    """OUI guesses are deliberately BLE-only -- every nearby AP/phone would
+    otherwise pick up a vendor badge, crowding the UI with low-value noise
+    (a phone showing "Apple, Inc.?" isn't a useful SAR lead). adv_data_json
+    with a "frame_type" key is wifi_source.py's payload shape, the signal
+    used to detect and skip this case.
+    """
+    adv_data_json = '{"frame_type": "beacon", "ssid": "SomeAP"}'
+    # e8:0a:b9 resolves to a real vendor (Cisco) via OUI when not a wifi
+    # frame -- see test_classify_falls_back_to_oui_when_no_fingerprint_matches --
+    # so this specifically proves the wifi tag is what suppresses it.
+    guess = classify("e8:0a:b9:11:22:33", device_name="SomeAP", adv_data_json=adv_data_json)
+    assert guess is None

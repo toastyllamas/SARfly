@@ -72,11 +72,19 @@ def classify(mac: str, device_name: str | None, adv_data_json: str | None) -> di
     """
     manufacturer_ids: set[int] = set()
     service_uuids: list[str] = []
+    is_wifi_frame = False
     if adv_data_json:
         try:
             adv = json.loads(adv_data_json)
         except (json.JSONDecodeError, TypeError):
             adv = {}
+        # "frame_type" is only ever present in wifi_source.py's payload
+        # shape -- BLE detections use manufacturer_data/service_data/
+        # service_uuids instead. Used below to skip the OUI fallback for
+        # WiFi: with every nearby AP/station picking up a vendor badge, the
+        # device list gets crowded with low-value noise (every phone in
+        # earshot showing "Apple, Inc.?" isn't a useful SAR lead).
+        is_wifi_frame = "frame_type" in adv
         for key in adv.get("manufacturer_data", {}):
             try:
                 manufacturer_ids.add(int(key))
@@ -91,6 +99,9 @@ def classify(mac: str, device_name: str | None, adv_data_json: str | None) -> di
             return {"vendor": fp.vendor, "confidence": "high", "reason": "service_uuid"}
         if device_name and any(p.search(device_name) for p in fp.name_patterns):
             return {"vendor": fp.vendor, "confidence": "medium", "reason": "device_name"}
+
+    if is_wifi_frame:
+        return None
 
     oui_vendor = lookup_oui(mac)
     if oui_vendor:
