@@ -18,6 +18,8 @@ import json
 import re
 from dataclasses import dataclass
 
+from oui_lookup import lookup_oui
+
 
 @dataclass
 class VendorFingerprint:
@@ -59,9 +61,14 @@ FINGERPRINTS: list[VendorFingerprint] = [
 ]
 
 
-def classify(device_name: str | None, adv_data_json: str | None) -> dict | None:
-    """Return {"vendor": ..., "confidence": "high"|"medium", "reason": ...}
+def classify(mac: str, device_name: str | None, adv_data_json: str | None) -> dict | None:
+    """Return {"vendor": ..., "confidence": "high"|"medium"|"low", "reason": ...}
     for the first matching fingerprint, or None if nothing matches.
+
+    Checks the specific BLE fingerprints (manufacturer id, service UUID,
+    device name) before falling back to a generic OUI hardware-vendor
+    lookup on the MAC -- a specific product-family match is more useful
+    than "some Espressif chip" when both are available.
     """
     manufacturer_ids: set[int] = set()
     service_uuids: list[str] = []
@@ -84,5 +91,9 @@ def classify(device_name: str | None, adv_data_json: str | None) -> dict | None:
             return {"vendor": fp.vendor, "confidence": "high", "reason": "service_uuid"}
         if device_name and any(p.search(device_name) for p in fp.name_patterns):
             return {"vendor": fp.vendor, "confidence": "medium", "reason": "device_name"}
+
+    oui_vendor = lookup_oui(mac)
+    if oui_vendor:
+        return {"vendor": oui_vendor, "confidence": "low", "reason": "oui"}
 
     return None

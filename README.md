@@ -158,11 +158,21 @@ Open **http://localhost:8080** for the ground-station UI.
   known devices as usual during the pre-flight baseline step. The
   fingerprint logic lives in `services/ground_station/app/vendor_id.py` as
   an extensible list, so adding Apple Watch/Fitbit/Suunto/Coros/etc. later
-  is a small addition, not a rewrite. WiFi-based identification was
-  considered and rejected for now: only a handful of high-end Garmin models
-  have WiFi at all, it only activates near a known saved network rather
-  than continuously in the field, and it would need an entirely separate
-  monitor-mode capture pipeline for a much weaker identification signal.
+  is a small addition, not a rewrite.
+- **OUI vendor lookup (low confidence)**: when nothing above matches, the
+  MAC's first three octets are checked against IEEE's public OUI registry
+  (bundled at `services/ground_station/app/data/oui.csv`, ~40k assignments,
+  so this works fully offline) to at least name a hardware manufacturer --
+  "Espressif Inc." rather than nothing. Skipped entirely for locally
+  administered (randomized) MACs, since those prefixes were never actually
+  IEEE-assigned and a lookup would risk a coincidentally-real-looking but
+  meaningless name; see `services/ground_station/app/oui_lookup.py`. This
+  is the weakest of the three confidence tiers (shown more faintly in the
+  UI) and applies to WiFi station detections (see below) as well as BLE
+  ones, since it only needs a MAC, not protocol-specific advertisement
+  data. To refresh the bundled registry later: `curl -o oui_raw.csv
+  https://standards-oui.ieee.org/oui/oui.csv`, then re-derive the two-column
+  `oui_prefix,vendor` CSV from its `Assignment`/`Organization Name` fields.
 - Clicking a row (or focusing its label field) **locks the view** — a
   banner confirms it's frozen. Live updates keep arriving in the background
   but stop repainting the table/map until you click the row again to

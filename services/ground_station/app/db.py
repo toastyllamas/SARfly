@@ -109,7 +109,7 @@ class Database:
             mac = r["mac"]
             if mac in guesses:
                 continue  # already found a match for this mac
-            guess = classify(r["device_name"], r["adv_data_json"])
+            guess = classify(mac, r["device_name"], r["adv_data_json"])
             if guess:
                 guesses[mac] = guess
         return guesses
