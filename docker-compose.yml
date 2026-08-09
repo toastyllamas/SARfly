@@ -128,6 +128,33 @@ services:
       RTLSDR_HIT_MARGIN_DB: "10"
       LOG_LEVEL: INFO
 
+  # Fifth, independent capture unit -- a monitor-mode-capable USB WiFi
+  # adapter capturing 802.11 probe requests and beacons from nearby
+  # stations/APs. Treated as an ephemeral RF presence signal, not a
+  # trackable device identity -- modern phones randomize their MAC address
+  # for probe requests, so a MAC seen here isn't a stable long-term
+  # identifier. Writes into the same shared detections.sqlite3's detections
+  # table (same shape as the BLE scanners), tagged with its own
+  # SOURCE_UNIT_ID. Starts unconditionally like the other scanners -- if the
+  # adapter isn't attached, wifi_source.py logs a warning and retries every
+  # 5s forever.
+  scanner-wifi:
+    build: ./services/scanner-wifi
+    image: ble-sar-df-scanner-wifi:local
+    restart: unless-stopped
+    logging: *default-logging
+    network_mode: host
+    privileged: true
+    volumes:
+      - ./data:/data
+    environment:
+      DB_PATH: /data/detections.sqlite3
+      GPSD_HOST: 127.0.0.1
+      GPSD_PORT: "2947"
+      SOURCE_UNIT_ID: ground-logger-wifi-01
+      WIFI_DWELL_S: "2"
+      LOG_LEVEL: INFO
+
   ground-station:
     build: ./services/ground_station
     image: ble-sar-df-ground-station:local
