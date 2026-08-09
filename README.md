@@ -352,6 +352,55 @@ or a device fails to enumerate, try a powered USB hub before assuming a
 software problem — this is a known sharp edge with SDR-class USB devices
 (the HackRF in particular) on Pi-class hardware.
 
+### Direct WiFi access point (hostapd)
+
+For field use without existing WiFi infrastructure, the Pi's onboard WiFi
+(`wlan0`) can run as its own access point via hostapd, so a laptop/phone can
+connect directly to the ground-station UI/SSH. Configs are in
+`deploy/pi-hostapd/`. This repurposes `wlan0` entirely -- it can no longer
+also be the Pi's uplink, so the Pi needs Ethernet (or a second WiFi adapter)
+for internet/LAN access once this is enabled.
+
+Raspberry Pi OS (Bookworm+) manages WiFi through NetworkManager, not
+`dhcpcd`, so hostapd needs `wlan0` handed off first or the two will fight
+over the interface:
+
+```
+sudo apt install hostapd dnsmasq
+sudo systemctl disable --now dnsmasq   # re-enabled below, once scoped
+
+# Hand wlan0 off to hostapd
+sudo cp deploy/pi-hostapd/unmanaged-wlan0.conf /etc/NetworkManager/conf.d/
+sudo systemctl reload NetworkManager
+
+# Static IP for wlan0 (hostapd brings the interface up itself)
+sudo cp deploy/pi-hostapd/wlan0-ap.network /etc/systemd/network/40-wlan0-ap.network
+sudo systemctl enable --now systemd-networkd
+
+# hostapd -- edit the passphrase first (this file is a template)
+sudo cp deploy/pi-hostapd/hostapd.conf /etc/hostapd/hostapd.conf
+sudo $EDITOR /etc/hostapd/hostapd.conf   # set wpa_passphrase
+sudo chmod 600 /etc/hostapd/hostapd.conf
+sudo sed -i 's|^#DAEMON_CONF=.*|DAEMON_CONF="/etc/hostapd/hostapd.conf"|' /etc/default/hostapd
+sudo systemctl unmask hostapd
+sudo systemctl enable --now hostapd
+
+# dnsmasq, scoped to wlan0 only -- see the file's own comments for why the
+# scoping matters (an unscoped dnsmasq can answer DHCP for someone else's
+# network on whatever interface the Pi's uplink is on)
+sudo sed -i 's|^#conf-dir=/etc/dnsmasq.d/,\*.conf|conf-dir=/etc/dnsmasq.d/,*.conf|' /etc/dnsmasq.conf
+sudo cp deploy/pi-hostapd/wlan0-ap.conf /etc/dnsmasq.d/wlan0-ap.conf
+sudo dnsmasq --test   # validate before (re-)starting
+sudo systemctl enable --now dnsmasq
+```
+
+Connect to the `SARfly` SSID and reach the ground station at
+`http://192.168.4.1:8080`. This setup gives connected devices access to the
+Pi only, not internet -- there's no NAT/IP-forwarding configured, by design,
+to keep the number of moving parts down. Add `net.ipv4.ip_forward=1` plus an
+`iptables`/`nft` MASQUERADE rule on the uplink interface if a connected
+laptop also needs internet through the Pi.
+
 ## Known limitations / not yet built
 
 - The ground-station UI has no authentication — fine bound to `localhost` or
