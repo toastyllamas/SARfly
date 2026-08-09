@@ -1,8 +1,20 @@
+# Bounds each container's on-disk log to 3 x 10MB files. Without this, the
+# default json-file driver never rotates -- a service stuck retrying every
+# 5s (e.g. a scanner waiting on a device that's unplugged, or gpsd being
+# down) will accumulate an unbounded, multi-day log file that makes `docker
+# logs`/`--since`/`-f` slow or unusable and eats disk space indefinitely.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   scanner:
     build: ./services/scanner
     image: ble-sar-df-scanner:local
     restart: unless-stopped
+    logging: *default-logging
     # Host networking is required so the container can reach the host's
     # D-Bus system bus (BlueZ) and gpsd's loopback socket without extra
     # port mappings or a bridge network complicating D-Bus addressing.
@@ -44,6 +56,7 @@ services:
       dockerfile: Dockerfile.ubertooth
     image: ble-sar-df-scanner-ubertooth:local
     restart: unless-stopped
+    logging: *default-logging
     # No BlueZ/D-Bus involved here (see ubertooth_source.py), but still
     # needs host networking to reach gpsd, and privileged for raw USB access
     # to the Ubertooth without per-device udev/cgroup wiring in compose.
@@ -72,6 +85,7 @@ services:
     build: ./services/scanner-spectrum
     image: ble-sar-df-scanner-spectrum:local
     restart: unless-stopped
+    logging: *default-logging
     network_mode: host
     privileged: true
     volumes:
@@ -99,6 +113,7 @@ services:
     build: ./services/scanner-rtlsdr
     image: ble-sar-df-scanner-rtlsdr:local
     restart: unless-stopped
+    logging: *default-logging
     network_mode: host
     privileged: true
     volumes:
@@ -117,6 +132,7 @@ services:
     build: ./services/ground_station
     image: ble-sar-df-ground-station:local
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       - scanner
       - scanner-spectrum
