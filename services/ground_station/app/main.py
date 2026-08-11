@@ -112,6 +112,11 @@ async def api_heatmap(mac: str | None = None) -> list[dict]:
     return db.heatmap(mac_filter=mac, precision=GRID_PRECISION)
 
 
+@app.get("/api/localizations")
+async def api_localizations() -> dict[str, dict]:
+    return db.localizations()
+
+
 @app.get("/api/spectrum_hits")
 async def api_spectrum_hits() -> list[dict]:
     return db.recent_spectrum_hits()

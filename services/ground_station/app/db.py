@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from localize import Sample, estimate
 from vendor_id import classify
 
 TAGS_SCHEMA = """
@@ -113,6 +114,45 @@ class Database:
             if guess:
                 guesses[mac] = guess
         return guesses
+
+    def localizations(self) -> dict[str, dict]:
+        """Estimate an emitter location for every device with enough
+        positioned detections, keyed by MAC.
+
+        Pulls all positioned (lat, lon, rssi) samples in one pass and groups
+        by MAC in Python -- the estimator is a closed-form weighted centroid,
+        so even tens of thousands of samples localize in milliseconds.
+        Devices that can't be localized (too few samples, or heard at flat
+        RSSI) are simply absent from the result.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT mac, lat, lon, rssi_dbm FROM detections
+            WHERE lat IS NOT NULL AND lon IS NOT NULL
+            ORDER BY mac
+            """
+        ).fetchall()
+        by_mac: dict[str, list[Sample]] = {}
+        for r in rows:
+            by_mac.setdefault(r["mac"], []).append(
+                Sample(lat=r["lat"], lon=r["lon"], rssi_dbm=r["rssi_dbm"])
+            )
+        out: dict[str, dict] = {}
+        for mac, samples in by_mac.items():
+            result = estimate(samples)
+            if result is None:
+                continue
+            out[mac] = {
+                "lat": result.lat,
+                "lon": result.lon,
+                "semi_major_m": result.semi_major_m,
+                "semi_minor_m": result.semi_minor_m,
+                "orientation_deg": result.orientation_deg,
+                "confidence": result.confidence,
+                "n_samples": result.n_samples,
+                "rssi_span_db": result.rssi_span_db,
+            }
+        return out
 
     def heatmap(self, mac_filter: str | None = None, precision: int = 4) -> list[dict]:
         """Grid-bin all positioned detections by rounded lat/lon (roughly

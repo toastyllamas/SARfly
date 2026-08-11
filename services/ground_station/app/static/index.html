@@ -135,6 +135,7 @@
   <label><input type="checkbox" id="filter-new"> Show only untagged</label>
   <label><input type="checkbox" id="show-heatmap"> Hit density heatmap</label>
   <label><input type="checkbox" id="show-spectrum"> Spectrum hits</label>
+  <label><input type="checkbox" id="show-localizations"> Localize devices</label>
   <button id="night-toggle">Night mode</button>
   <a class="btn" href="/api/kmz">Export KMZ</a>
   <button id="bulk-known" title="Tag every currently visible device as known">Mark all known</button>
@@ -279,6 +280,13 @@ const markerLayer = L.layerGroup().addTo(map);
 const heatLayer = L.layerGroup();
 const spectrumLayer = L.layerGroup();
 const missionPatternLayer = L.layerGroup().addTo(map);
+// Emitter-location estimates (app/localize.py, via /api/localizations). Kept
+// always on the map; its contents are rebuilt to show the selected device
+// always, plus every localizable visible device when the toggle is on.
+const localizationLayer = L.layerGroup().addTo(map);
+let localizations = {};   // mac -> {lat, lon, semi_major_m, ..., confidence}
+let selectedMac = null;
+const showLocalizations = document.getElementById('show-localizations');
 
 document.getElementById('night-toggle').addEventListener('click', () => {
   document.documentElement.classList.toggle('night');
@@ -296,6 +304,10 @@ showSpectrum.addEventListener('change', () => {
   // everything accumulated so far; turning it off should drop the
   // now-hidden layer's markers rather than let them sit around unused).
   rebuildSpectrumLayer();
+});
+showLocalizations.addEventListener('change', () => {
+  if (showLocalizations.checked) refreshLocalizations();
+  else renderLocalizations();
 });
 let searchDebounce = null;
 searchInput.addEventListener('input', () => {
@@ -458,6 +470,15 @@ function render() {
     labelInput.addEventListener('change', () => tagDevice(d.mac, d.status, labelInput.value));
 
     const actionsCell = tr.querySelector('td:last-child');
+    const loc = localizations[d.mac];
+    if (loc) {
+      const locBtn = document.createElement('button');
+      locBtn.textContent = d.mac === selectedMac ? '◎ locating' : '◎ locate';
+      locBtn.title = `Estimated location on map -- confidence ${loc.confidence}, ~${loc.semi_major_m} m`;
+      locBtn.style.marginRight = '8px';
+      locBtn.addEventListener('click', () => selectDevice(d.mac === selectedMac ? null : d.mac));
+      actionsCell.appendChild(locBtn);
+    }
     for (const status of ['known', 'unknown', 'ignore']) {
       const btn = document.createElement('button');
       btn.textContent = status;
@@ -476,6 +497,7 @@ function render() {
 
   renderMap(visible, query);
   if (showHeatmap.checked) updateHeatmap(query);
+  renderLocalizations();
 }
 
 function renderMap(visible, query) {
@@ -533,6 +555,84 @@ async function updateHeatmap(query) {
       fillOpacity: 0.45,
     }).bindTooltip(`${c.hits} hit(s)`).addTo(heatLayer);
   }
+}
+
+// --- Localization overlay: received-power-weighted-centroid estimate plus a
+// 1-sigma uncertainty ellipse per device, from /api/localizations. Shown for
+// the selected device always, and for every localizable visible device when
+// the "Localize devices" toggle is on. See app/localize.py for the estimator
+// and why a weighted centroid is used over path-loss trilateration. ---
+function ellipseLatLngs(lat, lon, semiMajorM, semiMinorM, orientationDeg, steps = 48) {
+  // orientation is the semi-major axis bearing from north; build the ellipse
+  // in local east/north metres, then convert each vertex back to lat/lon.
+  const th = orientationDeg * Math.PI / 180;
+  const sinB = Math.sin(th), cosB = Math.cos(th);
+  const mLon = metersPerDegLon(lat);
+  const pts = [];
+  for (let i = 0; i < steps; i++) {
+    const t = (i / steps) * 2 * Math.PI;
+    const u = semiMajorM * Math.cos(t);   // along semi-major axis
+    const v = semiMinorM * Math.sin(t);   // along semi-minor axis
+    const east = u * sinB + v * cosB;
+    const north = u * cosB - v * sinB;
+    pts.push([lat + north / METERS_PER_DEG_LAT, lon + east / mLon]);
+  }
+  return pts;
+}
+
+function drawLocalization(mac, loc, isSelected) {
+  // Opacity/weight grow with confidence, so a shaky low-confidence guess
+  // reads as visibly faint. Selected device is drawn in a distinct colour.
+  const conf = loc.confidence;
+  const color = isSelected ? '#00e5ff' : '#ff3860';
+  L.polygon(
+    ellipseLatLngs(loc.lat, loc.lon, loc.semi_major_m, loc.semi_minor_m, loc.orientation_deg),
+    { color, weight: isSelected ? 3 : 1 + 2 * conf, fillColor: color, fillOpacity: 0.08 + 0.32 * conf }
+  ).addTo(localizationLayer);
+  L.circleMarker([loc.lat, loc.lon], {
+    radius: 4, color, fillColor: color, fillOpacity: 1, weight: 1,
+  }).bindTooltip(
+    `${mac}\nestimated location -- confidence ${conf}\n~${loc.semi_major_m}x${loc.semi_minor_m} m (1-sigma), ` +
+    `${loc.n_samples} samples, ${loc.rssi_span_db} dB span`
+  ).addTo(localizationLayer);
+}
+
+function renderLocalizations() {
+  localizationLayer.clearLayers();
+  const drawn = new Set();
+  if (showLocalizations.checked) {
+    const visibleMacs = new Set(getVisibleDevices().map(d => d.mac));
+    for (const mac of Object.keys(localizations)) {
+      if (visibleMacs.has(mac)) {
+        drawLocalization(mac, localizations[mac], mac === selectedMac);
+        drawn.add(mac);
+      }
+    }
+  }
+  // The selected device's ellipse shows even when the show-all toggle is off.
+  if (selectedMac && localizations[selectedMac] && !drawn.has(selectedMac)) {
+    drawLocalization(selectedMac, localizations[selectedMac], true);
+  }
+}
+
+async function refreshLocalizations() {
+  try {
+    localizations = await (await fetch('/api/localizations')).json();
+  } catch (e) {
+    return;
+  }
+  // Re-render rows so locate buttons appear/update -- unless that would
+  // disturb an in-progress label edit or text selection, in which case only
+  // the map layer (which can't steal focus) is refreshed.
+  if (frozenMac === null && !hasTableSelection()) render();
+  else renderLocalizations();
+}
+
+function selectDevice(mac) {
+  selectedMac = mac;
+  if (mac && localizations[mac]) map.panTo([localizations[mac].lat, localizations[mac].lon]);
+  if (frozenMac === null && !hasTableSelection()) render();
+  else renderLocalizations();
 }
 
 // Markers currently reflected in spectrumLayer, kept in the same order and
@@ -908,6 +1008,11 @@ function connect() {
 
 connect();
 render();
+// Localization is a separate, heavier query (all positioned rows), so it runs
+// on its own slower cadence rather than on every 1 s device poll. This keeps
+// estimates and per-row locate buttons live as a search accumulates samples.
+refreshLocalizations();
+setInterval(refreshLocalizations, 10000);
 </script>
 </body>
 </html>
