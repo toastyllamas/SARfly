@@ -54,6 +54,10 @@ class Storage:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path, isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL;")
+        # Wait briefly for the write lock instead of erroring out with
+        # "database is locked" and dropping the detection -- several scanners
+        # plus the ground station all write/read this file concurrently.
+        self._conn.execute("PRAGMA busy_timeout=5000;")
         self._conn.executescript(SCHEMA)
 
     def insert_detection(self, d: Detection) -> None:
