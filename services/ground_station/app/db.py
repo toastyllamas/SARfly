@@ -39,33 +39,42 @@ class Database:
         self._conn.executescript(TAGS_SCHEMA)
 
     def max_detection_id(self) -> int:
-        row = self._conn.execute(
-            "SELECT COALESCE(MAX(id), 0) AS m FROM detections"
-        ).fetchone()
+        try:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS m FROM detections"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return 0  # detections table not created yet -- no BLE/WiFi scanner here
         return row["m"]
 
     def detections_since(self, since_id: int) -> list[sqlite3.Row]:
-        return self._conn.execute(
-            "SELECT * FROM detections WHERE id > ? ORDER BY id", (since_id,)
-        ).fetchall()
+        try:
+            return self._conn.execute(
+                "SELECT * FROM detections WHERE id > ? ORDER BY id", (since_id,)
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []  # no detections table (spectrum-only deployment)
 
     def device_summary(self) -> list[dict]:
-        latest_rows = self._conn.execute(
-            """
-            SELECT d.mac, d.device_name, d.rssi_dbm, d.lat, d.lon, d.alt_m,
-                   d.timestamp_utc AS last_seen
-            FROM detections d
-            JOIN (
-                SELECT mac, MAX(id) AS max_id FROM detections GROUP BY mac
-            ) latest ON d.mac = latest.mac AND d.id = latest.max_id
-            """
-        ).fetchall()
-        count_rows = self._conn.execute(
-            """
-            SELECT mac, COUNT(*) AS count, MIN(timestamp_utc) AS first_seen
-            FROM detections GROUP BY mac
-            """
-        ).fetchall()
+        try:
+            latest_rows = self._conn.execute(
+                """
+                SELECT d.mac, d.device_name, d.rssi_dbm, d.lat, d.lon, d.alt_m,
+                       d.timestamp_utc AS last_seen
+                FROM detections d
+                JOIN (
+                    SELECT mac, MAX(id) AS max_id FROM detections GROUP BY mac
+                ) latest ON d.mac = latest.mac AND d.id = latest.max_id
+                """
+            ).fetchall()
+            count_rows = self._conn.execute(
+                """
+                SELECT mac, COUNT(*) AS count, MIN(timestamp_utc) AS first_seen
+                FROM detections GROUP BY mac
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []  # no detections table yet -- nothing to summarize
         tag_rows = self._conn.execute(
             "SELECT mac, status, label FROM device_tags"
         ).fetchall()
@@ -107,9 +116,12 @@ class Database:
         every single advertising event, so checking only the newest
         detection risks false negatives.
         """
-        rows = self._conn.execute(
-            "SELECT DISTINCT mac, device_name, adv_data_json FROM detections"
-        ).fetchall()
+        try:
+            rows = self._conn.execute(
+                "SELECT DISTINCT mac, device_name, adv_data_json FROM detections"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}  # no detections table yet
         guesses: dict[str, dict] = {}
         for r in rows:
             mac = r["mac"]
@@ -130,13 +142,16 @@ class Database:
         Devices that can't be localized (too few samples, or heard at flat
         RSSI) are simply absent from the result.
         """
-        rows = self._conn.execute(
-            """
-            SELECT mac, lat, lon, rssi_dbm FROM detections
-            WHERE lat IS NOT NULL AND lon IS NOT NULL
-            ORDER BY mac
-            """
-        ).fetchall()
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT mac, lat, lon, rssi_dbm FROM detections
+                WHERE lat IS NOT NULL AND lon IS NOT NULL
+                ORDER BY mac
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}  # no detections table (spectrum-only deployment)
         by_mac: dict[str, list[Sample]] = {}
         for r in rows:
             by_mac.setdefault(r["mac"], []).append(
@@ -173,7 +188,10 @@ class Database:
             query += " AND mac LIKE ?"
             params.append(f"%{mac_filter}%")
         query += " GROUP BY glat, glon"
-        rows = self._conn.execute(query, params).fetchall()
+        try:
+            rows = self._conn.execute(query, params).fetchall()
+        except sqlite3.OperationalError:
+            return []  # no detections table (spectrum-only deployment)
         return [{"lat": r["glat"], "lon": r["glon"], "hits": r["hits"]} for r in rows]
 
     def max_spectrum_hit_id(self) -> int:
