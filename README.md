@@ -373,6 +373,12 @@ connect directly to the ground-station UI/SSH. Configs are in
 also be the Pi's uplink, so the Pi needs Ethernet (or a second WiFi adapter)
 for internet/LAN access once this is enabled.
 
+The AP runs on **5GHz (channel 36)**, deliberately kept off the 2.4GHz ISM
+band the scanners listen on (BLE/WiFi) so it doesn't transmit into our own
+capture band and raise the noise floor near the Pi. Almost all client devices
+support 5GHz; if you need longer range or wall penetration and can accept the
+self-interference cost, switch `hostapd.conf` back to `hw_mode=g`/`channel=6`.
+
 Raspberry Pi OS (Bookworm+) manages WiFi through NetworkManager, not
 `dhcpcd`, so hostapd needs `wlan0` handed off first or the two will fight
 over the interface:

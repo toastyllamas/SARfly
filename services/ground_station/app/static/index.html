@@ -125,6 +125,7 @@
     border-radius: 4px; padding: 4px; font-size: 12px;
   }
   .muted { color: var(--muted); }
+  #map-legend { font-size: 12px; line-height: 1.45; margin: 4px 0 0; max-width: 70ch; }
   .empty { padding: 24px; text-align: center; color: var(--muted); }
 </style>
 </head>
@@ -147,6 +148,13 @@
   <div id="map-panel">
     <div id="map"></div>
     <p class="muted" id="map-caption"></p>
+    <p class="muted" id="map-legend">
+      <b>Localize devices</b> (red ellipse): estimated device location from BLE/WiFi
+      signal strength along the track &mdash; brighter = higher confidence, cyan = selected
+      device. These decoded-device fixes are the <b>primary</b> search signal.
+      <b>Spectrum hits</b> are a coarse wide-band energy backstop &mdash; raw RF power in a
+      band, not a located or identified device.
+    </p>
     <div id="mission-panel">
       <div class="mission-row">
         <button id="draw-box-btn">Draw search box</button>
