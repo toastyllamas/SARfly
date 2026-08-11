@@ -141,6 +141,7 @@
   <a class="btn" href="/api/kmz">Export KMZ</a>
   <button id="bulk-known" title="Tag every currently visible device as known">Mark all known</button>
   <button id="bulk-ignore" title="Tag every currently visible device as ignore">Ignore all</button>
+  <button id="compact-db" title="Reclaim disk space from deleted rows (keeps all data)">Compact DB</button>
   <button id="reset-db" title="Delete ALL detections and tags">Reset Database</button>
   <span id="search"><input type="text" id="search-input" placeholder="Search MAC / name / label"></span>
 </header>
@@ -428,6 +429,23 @@ document.getElementById('reset-db').addEventListener('click', async () => {
   if (!confirm('This permanently deletes ALL detections, spectrum hits, and tags. Reset the database?')) return;
   frozenMac = null;
   await fetch('/api/reset', { method: 'POST' });
+});
+
+document.getElementById('compact-db').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Compacting...';
+  try {
+    const r = await (await fetch('/api/vacuum', { method: 'POST' })).json();
+    const mb = (b) => (b / 1048576).toFixed(1);
+    alert(`Compacted: ${mb(r.before_bytes)} MB -> ${mb(r.after_bytes)} MB (reclaimed ${mb(r.before_bytes - r.after_bytes)} MB). No data was deleted.`);
+  } catch (err) {
+    alert('Compact failed (the database may be busy) -- try again in a moment.');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
 });
 
 function setFrozen(mac) {

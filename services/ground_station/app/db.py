@@ -7,6 +7,7 @@ the scanner's inserts.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 
 from localize import Sample, estimate
@@ -28,9 +29,13 @@ class Database:
         # write from set_tag() in an open transaction, which freezes this
         # connection's view of the database and hides subsequent inserts
         # made by the scanner process.
+        self._db_path = str(db_path)
         self._conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL;")
+        # Let writes/VACUUM wait briefly for a gap rather than erroring out the
+        # instant a scanner happens to hold the write lock.
+        self._conn.execute("PRAGMA busy_timeout=5000;")
         self._conn.executescript(TAGS_SCHEMA)
 
     def max_detection_id(self) -> int:
@@ -235,6 +240,29 @@ class Database:
             self._conn.execute("DELETE FROM spectrum_hits")
         except sqlite3.OperationalError:
             pass  # scanner-spectrum never deployed -- nothing to clear
+        # A bulk DELETE leaves the freed pages in the file rather than
+        # returning them to the OS -- the main source of the file ballooning
+        # to hundreds of MB for a few thousand rows. Reclaim right here, when
+        # the tables were just emptied and there's almost nothing to rewrite.
+        try:
+            self.vacuum()
+        except sqlite3.OperationalError:
+            pass  # couldn't get the lock in time; not worth failing a reset over
+
+    def vacuum(self) -> dict:
+        """Rebuild the database file to reclaim free pages SQLite otherwise
+        keeps (see reset()), and truncate the WAL. Returns before/after file
+        sizes in bytes so callers can report how much was reclaimed.
+
+        Safe to run during live capture: the connection's busy_timeout lets
+        VACUUM wait for a brief gap in scanner writes. VACUUM needs temp space
+        roughly the size of the current file while it rebuilds.
+        """
+        before = os.path.getsize(self._db_path) if os.path.exists(self._db_path) else 0
+        self._conn.execute("VACUUM")
+        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        after = os.path.getsize(self._db_path) if os.path.exists(self._db_path) else 0
+        return {"before_bytes": before, "after_bytes": after}
 
     def bulk_set_status(self, macs: list[str], status: str) -> None:
         """Set status for many devices at once, preserving any existing

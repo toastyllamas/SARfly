@@ -140,6 +140,11 @@ async def api_bulk_tag(body: dict) -> dict:
     return {"ok": True, "count": len(macs)}
 
 
+@app.post("/api/vacuum")
+async def api_vacuum() -> dict:
+    return db.vacuum()
+
+
 @app.post("/api/reset")
 async def api_reset() -> dict:
     db.reset()
