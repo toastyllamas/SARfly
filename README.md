@@ -99,7 +99,7 @@ dev laptop and on the Raspberry Pi target.
 ## Running
 
 ```bash
-cd ble-sar-df
+cd sarfly
 docker compose up --build
 ```
 

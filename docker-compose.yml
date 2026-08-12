@@ -9,10 +9,12 @@ x-logging: &default-logging
     max-size: "10m"
     max-file: "3"
 
+name: sarfly
+
 services:
   scanner:
     build: ./services/scanner
-    image: ble-sar-df-scanner:local
+    image: sarfly-scanner:local
     restart: unless-stopped
     logging: *default-logging
     # Host networking is required so the container can reach the host's
@@ -54,7 +56,7 @@ services:
     build:
       context: ./services/scanner
       dockerfile: Dockerfile.ubertooth
-    image: ble-sar-df-scanner-ubertooth:local
+    image: sarfly-scanner-ubertooth:local
     restart: unless-stopped
     logging: *default-logging
     # No BlueZ/D-Bus involved here (see ubertooth_source.py), but still
@@ -83,7 +85,7 @@ services:
   # logs a warning and retries every 5s forever.
   scanner-spectrum:
     build: ./services/scanner-spectrum
-    image: ble-sar-df-scanner-spectrum:local
+    image: sarfly-scanner-spectrum:local
     restart: unless-stopped
     logging: *default-logging
     network_mode: host
@@ -111,7 +113,7 @@ services:
   # a warning and retries every 5s forever.
   scanner-rtlsdr:
     build: ./services/scanner-rtlsdr
-    image: ble-sar-df-scanner-rtlsdr:local
+    image: sarfly-scanner-rtlsdr:local
     restart: unless-stopped
     logging: *default-logging
     network_mode: host
@@ -140,7 +142,7 @@ services:
   # 5s forever.
   scanner-wifi:
     build: ./services/scanner-wifi
-    image: ble-sar-df-scanner-wifi:local
+    image: sarfly-scanner-wifi:local
     restart: unless-stopped
     logging: *default-logging
     network_mode: host
@@ -157,7 +159,7 @@ services:
 
   ground-station:
     build: ./services/ground_station
-    image: ble-sar-df-ground-station:local
+    image: sarfly-ground-station:local
     restart: unless-stopped
     logging: *default-logging
     depends_on:
