@@ -107,7 +107,12 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 @app.get("/")
 async def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+    # no-cache = the browser must revalidate with the server before reusing a
+    # cached copy, so a redeploy shows up on the next normal reload instead of
+    # a stale page lingering (Safari/iPad cache the SPA shell aggressively).
+    return FileResponse(
+        STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"}
+    )
 
 
 @app.get("/api/devices")
