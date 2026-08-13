@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>BLE SAR Ground Station</title>
+<title>SARfly Ground Station</title>
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
 <style>
@@ -84,7 +84,9 @@
   #map {
     width: 100%; height: 60vh; background: var(--panel); border-radius: 8px;
   }
-  .leaflet-container { background: var(--panel); }
+  /* Neutral grey (not the dark panel colour) so tiles that aren't cached yet
+     read as a blank map area rather than an alarming black void offline. */
+  .leaflet-container { background: #8c949c; }
   .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: var(--panel); color: var(--text); }
   .leaflet-control-zoom a { background: var(--panel) !important; color: var(--text) !important; border-color: var(--border) !important; }
   #table-panel { padding: 12px; overflow-x: auto; }
@@ -126,17 +128,23 @@
   }
   .muted { color: var(--muted); }
   #map-legend { font-size: 12px; line-height: 1.45; margin: 4px 0 0; max-width: 70ch; }
+  #pause-toggle.active { background: #b8860b; color: #fff; border-color: #b8860b; }
+  #map-caption.paused-note::before {
+    content: '⏸ PAUSED — live updates frozen. ';
+    color: #b8860b; font-weight: bold;
+  }
   .empty { padding: 24px; text-align: center; color: var(--muted); }
 </style>
 </head>
 <body>
 <header>
   <span class="dot" id="conn-dot"></span>
-  <h1>BLE SAR Ground Station</h1>
+  <h1>SARfly Ground Station</h1>
   <label><input type="checkbox" id="filter-new"> Show only untagged</label>
   <label><input type="checkbox" id="show-heatmap"> Hit density heatmap</label>
   <label><input type="checkbox" id="show-spectrum"> Spectrum hits</label>
   <label><input type="checkbox" id="show-localizations"> Localize devices</label>
+  <button id="pause-toggle" title="Freeze the view for review -- capture keeps running, but the map and list stop updating with new hits">Pause live updates</button>
   <button id="night-toggle">Night mode</button>
   <a class="btn" href="/api/kmz">Export KMZ</a>
   <button id="bulk-known" title="Tag every currently visible device as known">Mark all known</button>
@@ -161,6 +169,13 @@
         <button id="draw-box-btn">Draw search box</button>
         <button id="clear-box-btn" disabled>Clear</button>
         <button id="generate-pattern-btn" disabled>Generate search pattern</button>
+      </div>
+      <div class="mission-row">
+        <button id="download-tiles-btn" title="While on internet, cache this area's map tiles so the map works offline in the field. Uses the search box if drawn, otherwise the current map view.">Download map for offline use</button>
+        <label>up to zoom
+          <input type="number" id="tile-zoom-max" value="16" min="10" max="19" step="1" style="width:4em">
+        </label>
+        <span class="muted" id="tile-status"></span>
       </div>
       <div class="mission-row">
         <label>AGL (m) <input type="number" id="mission-agl" value="60" min="1" step="1"></label>
@@ -262,6 +277,9 @@ let missionBoxLayer = null;
 let drawingBox = false;
 let drawStart = null;
 let spacingManuallySet = false;
+// When true, live WebSocket updates are ignored so the view stays frozen for
+// post-flight review. Capture keeps running server-side; only the UI freezes.
+let paused = false;
 
 const dot = document.getElementById('conn-dot');
 const rowsEl = document.getElementById('device-rows');
@@ -279,9 +297,17 @@ const rangeInput = document.getElementById('mission-range');
 const spacingInput = document.getElementById('mission-spacing');
 const spacingAutoBtn = document.getElementById('mission-spacing-auto');
 const missionStatusEl = document.getElementById('mission-status');
+const pauseToggle = document.getElementById('pause-toggle');
+const downloadTilesBtn = document.getElementById('download-tiles-btn');
+const tileZoomMaxInput = document.getElementById('tile-zoom-max');
+const tileStatusEl = document.getElementById('tile-status');
 
 const map = L.map('map').setView([0, 0], 2);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+// Tiles come from the ground station's own cache (/tiles/...), not directly
+// from OSM -- so the map works in the field with no internet as long as the
+// area was prefetched. Uncached tiles are fetched+cached when online, and
+// show as a blank (neutral-grey) tile when offline.
+L.tileLayer('/tiles/{z}/{x}/{y}.png', {
   maxZoom: 19,
   attribution: '&copy; OpenStreetMap contributors',
 }).addTo(map);
@@ -300,6 +326,60 @@ const showLocalizations = document.getElementById('show-localizations');
 document.getElementById('night-toggle').addEventListener('click', () => {
   document.documentElement.classList.toggle('night');
 });
+
+pauseToggle.addEventListener('click', async () => {
+  paused = !paused;
+  pauseToggle.textContent = paused ? '▶ Resume live updates' : 'Pause live updates';
+  pauseToggle.classList.toggle('active', paused);
+  captionEl.classList.toggle('paused-note', paused);
+  if (!paused) {
+    // Resuming: pull the current state at once so the view jumps straight to
+    // live rather than waiting for the next incremental message.
+    try {
+      devices = await (await fetch('/api/devices')).json();
+      spectrumHits = await (await fetch('/api/spectrum_hits')).json();
+      rebuildSpectrumLayer();
+    } catch (e) { /* stay on last-known view if the fetch fails */ }
+    await refreshLocalizations();
+    render();
+  }
+});
+
+async function pollTilePrefetch() {
+  const s = await (await fetch('/api/tiles/prefetch')).json();
+  const failed = s.errors ? ` (${s.errors} failed)` : '';
+  if (s.running) {
+    tileStatusEl.textContent = `downloading ${s.done}/${s.total} tiles${failed}...`;
+    setTimeout(pollTilePrefetch, 500);
+  } else {
+    tileStatusEl.textContent = s.total ? `cached ${s.total} tiles${failed} -- map ready offline for this area` : '';
+    downloadTilesBtn.disabled = false;
+  }
+}
+
+downloadTilesBtn.addEventListener('click', async () => {
+  // Prefer the drawn search box; fall back to whatever's currently in view.
+  const b = missionBoxBounds || map.getBounds();
+  const zoomMax = Math.max(10, Math.min(19, parseInt(tileZoomMaxInput.value, 10) || 16));
+  downloadTilesBtn.disabled = true;
+  tileStatusEl.textContent = 'starting...';
+  const resp = await (await fetch('/api/tiles/prefetch', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      south: b.getSouth(), west: b.getWest(), north: b.getNorth(), east: b.getEast(),
+      zoom_min: 12, zoom_max: zoomMax,
+    }),
+  })).json();
+  if (!resp.ok) {
+    tileStatusEl.textContent = resp.reason === 'too many tiles'
+      ? `too many tiles (${resp.count} > ${resp.max}) -- draw a smaller box or lower the max zoom`
+      : `could not start: ${resp.reason || 'error'}`;
+    downloadTilesBtn.disabled = false;
+    return;
+  }
+  pollTilePrefetch();
+});
+
 filterNew.addEventListener('change', render);
 showHeatmap.addEventListener('change', () => {
   if (showHeatmap.checked) heatLayer.addTo(map); else map.removeLayer(heatLayer);
@@ -642,6 +722,7 @@ function renderLocalizations() {
 }
 
 async function refreshLocalizations() {
+  if (paused) return;  // frozen for review -- don't recompute/redraw
   try {
     localizations = await (await fetch('/api/localizations')).json();
   } catch (e) {
@@ -992,6 +1073,9 @@ function connect() {
   ws.onclose = () => { dot.classList.remove('connected'); setTimeout(connect, 2000); };
   ws.onerror = () => ws.close();
   ws.onmessage = (ev) => {
+    // Paused = frozen for review: drop live updates entirely (capture keeps
+    // running server-side; Resume re-syncs to the current state).
+    if (paused) return;
     const msg = JSON.parse(ev.data);
     if (msg.type === 'devices') {
       devices = msg.devices;

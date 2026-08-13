@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 
 from db import Database
 from kmz import build_kmz
+from tiles import MAX_PREFETCH_TILES, TileCache, count_tiles, tile_list
 
 logger = logging.getLogger("ground_station")
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -29,8 +30,15 @@ DB_PATH = os.environ.get("DB_PATH", "/data/detections.sqlite3")
 POLL_INTERVAL_S = float(os.environ.get("POLL_INTERVAL_S", "1.0"))
 GRID_PRECISION = int(os.environ.get("GRID_PRECISION", "4"))
 STATIC_DIR = Path(__file__).parent / "static"
+# Offline map-tile cache lives next to the DB (a persisted bind mount), so
+# prefetched tiles survive restarts and are available with no connectivity.
+TILE_CACHE_DIR = os.environ.get("TILE_CACHE_DIR", str(Path(DB_PATH).parent / "tiles"))
 
 db = Database(DB_PATH)
+tile_cache = TileCache(TILE_CACHE_DIR)
+
+# State of the one-at-a-time area prefetch, polled by the UI.
+prefetch_state: dict = {"running": False, "total": 0, "done": 0, "errors": 0}
 
 
 class ConnectionManager:
@@ -115,6 +123,70 @@ async def api_heatmap(mac: str | None = None) -> list[dict]:
 @app.get("/api/localizations")
 async def api_localizations() -> dict[str, dict]:
     return db.localizations()
+
+
+@app.get("/tiles/{z}/{x}/{y}.png")
+async def api_tile(z: int, x: int, y: int) -> Response:
+    """Serve a map tile from the local cache. On a cache miss, fetch it from
+    OSM and cache it (works only when online); if that fails -- e.g. in the
+    field with no connectivity and the tile wasn't prefetched -- return 404 so
+    the map just shows a blank tile there rather than erroring."""
+    cached = tile_cache.cached_path(z, x, y)
+    if cached is None:
+        loop = asyncio.get_running_loop()
+        try:
+            data = await loop.run_in_executor(None, tile_cache.fetch_and_store, z, x, y)
+        except Exception:
+            return Response(status_code=404)
+        return Response(content=data, media_type="image/png")
+    return FileResponse(cached, media_type="image/png")
+
+
+async def _run_prefetch(tiles: list[tuple[int, int, int]]) -> None:
+    """Download any not-yet-cached tiles in `tiles`, one at a time with a small
+    delay to stay polite to OSM, updating prefetch_state as it goes."""
+    loop = asyncio.get_running_loop()
+    try:
+        for z, x, y in tiles:
+            if tile_cache.cached_path(z, x, y) is None:
+                try:
+                    await loop.run_in_executor(None, tile_cache.fetch_and_store, z, x, y)
+                    await asyncio.sleep(0.05)  # politeness throttle
+                except Exception:
+                    prefetch_state["errors"] += 1
+            prefetch_state["done"] += 1
+    finally:
+        prefetch_state["running"] = False
+
+
+@app.post("/api/tiles/prefetch")
+async def api_tiles_prefetch(body: dict) -> dict:
+    """Start caching all tiles covering a bbox across a zoom range, so the map
+    works offline there later. bbox = {south, west, north, east}."""
+    if prefetch_state["running"]:
+        return {"ok": False, "reason": "already running", **prefetch_state}
+    try:
+        south, west = float(body["south"]), float(body["west"])
+        north, east = float(body["north"]), float(body["east"])
+        zoom_min = int(body.get("zoom_min", 12))
+        zoom_max = int(body.get("zoom_max", 16))
+    except (KeyError, ValueError, TypeError):
+        return {"ok": False, "reason": "bad request -- need south/west/north/east"}
+    # Count arithmetically BEFORE materializing -- a wide bbox at high zoom is
+    # billions of tiles, and tile_list() on that would hang/OOM the server.
+    count = count_tiles(south, west, north, east, zoom_min, zoom_max)
+    if count > MAX_PREFETCH_TILES:
+        return {"ok": False, "reason": "too many tiles", "count": count,
+                "max": MAX_PREFETCH_TILES}
+    tiles = tile_list(south, west, north, east, zoom_min, zoom_max)
+    prefetch_state.update(running=True, total=len(tiles), done=0, errors=0)
+    asyncio.create_task(_run_prefetch(tiles))
+    return {"ok": True, "total": len(tiles)}
+
+
+@app.get("/api/tiles/prefetch")
+async def api_tiles_prefetch_status() -> dict:
+    return prefetch_state
 
 
 @app.get("/api/spectrum_hits")
