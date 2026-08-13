@@ -309,7 +309,10 @@ const map = L.map('map').setView([0, 0], 2);
 // show as a blank (neutral-grey) tile when offline.
 L.tileLayer('/tiles/{z}/{x}/{y}.png', {
   maxZoom: 19,
-  attribution: '&copy; OpenStreetMap contributors',
+  // USGS aerial imagery is native to ~z16; beyond that Leaflet upscales the
+  // z16 tiles rather than requesting tiles that don't exist (blank squares).
+  maxNativeZoom: 16,
+  attribution: 'Imagery: USGS The National Map',
 }).addTo(map);
 const markerLayer = L.layerGroup().addTo(map);
 const heatLayer = L.layerGroup();

@@ -19,13 +19,22 @@ import math
 import os
 import urllib.request
 
-# OSM's tile usage policy requires an identifying User-Agent and rules out
-# heavy bulk downloading; prefetch is deliberately capped (see MAX_PREFETCH_TILES)
-# and rate-limited to stay within acceptable low-volume use for a field tool.
-OSM_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-USER_AGENT = "SARfly/1.0 (offline SAR field map cache; low-volume area prefetch)"
+# Tiles come from the USGS National Map (US federal, public domain): it permits
+# caching and offline use, needs no API key, and aerial imagery is a better SAR
+# basemap than a street map. This is a deliberate move OFF OpenStreetMap, whose
+# tile usage policy forbids exactly what we do -- server-side proxying, caching,
+# and bulk prefetch -- and returns "not following the tile usage policy" 403s
+# under that load. The URL uses ArcGIS {z}/{y}/{x} order (row/col); our internal
+# (z, x, y) maps straight through since named .format() placeholders reorder it.
+# Override TILE_SOURCE_URL to switch to topo (.../USGSTopo/...) or another XYZ
+# source; keep the {z}/{x}/{y} placeholder names whatever their path order.
+SOURCE_URL = os.environ.get(
+    "TILE_SOURCE_URL",
+    "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}",
+)
+USER_AGENT = "SARfly/1.0 (search-and-rescue field tool; offline map cache)"
 
-MAX_PREFETCH_TILES = 20000  # hard cap so one request can't blow up disk / hammer OSM
+MAX_PREFETCH_TILES = 20000  # hard cap so one request can't blow up disk / hammer the source
 
 
 def deg2tile(lat_deg: float, lon_deg: float, z: int) -> tuple[int, int]:
@@ -78,7 +87,7 @@ def tile_list(south: float, west: float, north: float, east: float,
 def _fetch_tile(z: int, x: int, y: int, timeout: float = 10.0) -> bytes:
     """Download one tile from OSM. Isolated so tests can monkeypatch it."""
     req = urllib.request.Request(
-        OSM_URL.format(z=z, x=x, y=y), headers={"User-Agent": USER_AGENT}
+        SOURCE_URL.format(z=z, x=x, y=y), headers={"User-Agent": USER_AGENT}
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()

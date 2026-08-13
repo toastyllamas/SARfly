@@ -133,9 +133,9 @@ async def api_localizations() -> dict[str, dict]:
 @app.get("/tiles/{z}/{x}/{y}.png")
 async def api_tile(z: int, x: int, y: int) -> Response:
     """Serve a map tile from the local cache. On a cache miss, fetch it from
-    OSM and cache it (works only when online); if that fails -- e.g. in the
-    field with no connectivity and the tile wasn't prefetched -- return 404 so
-    the map just shows a blank tile there rather than erroring."""
+    the tile source (USGS) and cache it (works only when online); if that fails
+    -- e.g. in the field with no connectivity and the tile wasn't prefetched --
+    return 404 so the map just shows a blank tile there rather than erroring."""
     cached = tile_cache.cached_path(z, x, y)
     if cached is None:
         loop = asyncio.get_running_loop()
@@ -149,7 +149,7 @@ async def api_tile(z: int, x: int, y: int) -> Response:
 
 async def _run_prefetch(tiles: list[tuple[int, int, int]]) -> None:
     """Download any not-yet-cached tiles in `tiles`, one at a time with a small
-    delay to stay polite to OSM, updating prefetch_state as it goes."""
+    delay to stay polite to the tile source, updating prefetch_state as it goes."""
     loop = asyncio.get_running_loop()
     try:
         for z, x, y in tiles:
