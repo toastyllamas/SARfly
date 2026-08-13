@@ -307,7 +307,10 @@ const map = L.map('map').setView([0, 0], 2);
 // from OSM -- so the map works in the field with no internet as long as the
 // area was prefetched. Uncached tiles are fetched+cached when online, and
 // show as a blank (neutral-grey) tile when offline.
-L.tileLayer('/tiles/{z}/{x}/{y}.png', {
+// ?v is a cache-buster: bump it whenever the tile source changes so browsers
+// re-fetch instead of serving tiles cached from the previous source (v=usgs1
+// abandons the old OpenStreetMap tiles). The server ignores the query string.
+L.tileLayer('/tiles/{z}/{x}/{y}.png?v=usgs1', {
   maxZoom: 19,
   // USGS aerial imagery is native to ~z16; beyond that Leaflet upscales the
   // z16 tiles rather than requesting tiles that don't exist (blank squares).
