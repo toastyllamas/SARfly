@@ -2,9 +2,20 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>SARfly Ground Station</title>
-<link rel="icon" href="data:,">
+<link rel="icon" href="/static/icons/icon-192.png">
+<!-- PWA: installable + full-screen home-screen app. The manifest + Apple meta
+     tags give an installable icon and standalone (chrome-free) mode via "Add to
+     Home Screen", which works even over plain HTTP on the field LAN/AP. The
+     service worker (offline shell caching) needs a secure context, so it only
+     registers under HTTPS/localhost -- harmless no-op over HTTP. -->
+<link rel="manifest" href="/static/manifest.webmanifest">
+<meta name="theme-color" content="#0f1720">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="SARfly">
+<link rel="apple-touch-icon" href="/static/icons/icon-180.png">
 <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
 <style>
   :root {
@@ -89,15 +100,33 @@
   .leaflet-container { background: #8c949c; }
   .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: var(--panel); color: var(--text); }
   .leaflet-control-zoom a { background: var(--panel) !important; color: var(--text) !important; border-color: var(--border) !important; }
-  #table-panel { padding: 12px; overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
-  th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--bg); }
-  th.sortable { cursor: pointer; user-select: none; }
-  th.sortable:hover { color: var(--text); }
-  th.sortable .arrow { display: inline-block; width: 1em; opacity: 0.6; }
-  tr.row-unknown { background: color-mix(in srgb, var(--unknown) 12%, transparent); }
-  tr.row-highlight { outline: 1px solid var(--accent); }
+  #table-panel { padding: 12px; }
+  /* Card list -- replaces a wide horizontally-scrolling table so touch/field
+     devices never have to scroll right to reach the action buttons. Cards
+     flow into as many columns as fit; one per row on a narrow tablet. */
+  #list-controls {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px;
+  }
+  #device-rows {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px;
+  }
+  .device-card {
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+    background: var(--panel); display: flex; flex-direction: column; gap: 8px;
+  }
+  .device-card.row-unknown { background: color-mix(in srgb, var(--unknown) 12%, var(--panel)); }
+  .device-card.row-highlight { outline: 2px solid var(--accent); }
+  .card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .card-head .dev-name { font-weight: 600; font-size: 14px; }
+  .card-head .locate-btn { margin-left: auto; }
+  .card-meta {
+    display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; font-variant-numeric: tabular-nums;
+  }
+  .card-meta .mac { font-family: ui-monospace, monospace; }
+  .card-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  /* Bigger tap targets for field/tablet use. */
+  .card-actions button { padding: 6px 12px; font-size: 13px; }
+  .card-actions input[type=text] { flex: 1 1 120px; min-width: 100px; }
   .badge {
     display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px;
     font-weight: 600; color: #04140a;
@@ -192,21 +221,21 @@
     <p class="muted" id="freeze-banner" style="display:none">
       Editing this device's label — live updates are paused so your typing isn't disturbed.
     </p>
-    <table>
-      <thead>
-        <tr>
-          <th class="sortable" data-field="status">Status <span class="arrow"></span></th>
-          <th class="sortable" data-field="device_name">Name <span class="arrow"></span></th>
-          <th class="sortable" data-field="mac">MAC <span class="arrow"></span></th>
-          <th class="sortable" data-field="rssi_dbm">RSSI <span class="arrow"></span></th>
-          <th class="sortable" data-field="last_seen">Last seen <span class="arrow"></span></th>
-          <th class="sortable" data-field="count">Count <span class="arrow"></span></th>
-          <th class="sortable" data-field="label">Label <span class="arrow"></span></th>
-          <th>Actions</th>
-        </tr>
-      </thead>
-      <tbody id="device-rows"></tbody>
-    </table>
+    <div id="list-controls">
+      <label>Sort by
+        <select id="sort-select">
+          <option value="last_seen">Last seen</option>
+          <option value="rssi_dbm">RSSI</option>
+          <option value="count">Count</option>
+          <option value="status">Status</option>
+          <option value="device_name">Name</option>
+          <option value="mac">MAC</option>
+          <option value="label">Label</option>
+        </select>
+      </label>
+      <button id="sort-dir" title="Toggle ascending / descending">▼</button>
+    </div>
+    <div id="device-rows"></div>
     <div class="empty" id="empty-msg" style="display:none">No detections yet.</div>
   </div>
 </main>
@@ -476,25 +505,18 @@ function sortDevices(list) {
   });
 }
 
-function setSort(field) {
-  if (sortField === field) {
-    sortDir = sortDir === 'asc' ? 'desc' : 'asc';
-  } else {
-    sortField = field;
-    sortDir = 'asc';
-  }
+const sortSelect = document.getElementById('sort-select');
+const sortDirBtn = document.getElementById('sort-dir');
+sortSelect.value = sortField;
+sortSelect.addEventListener('change', () => { sortField = sortSelect.value; render(); });
+sortDirBtn.addEventListener('click', () => {
+  sortDir = sortDir === 'asc' ? 'desc' : 'asc';
   render();
-}
-
-for (const th of document.querySelectorAll('th.sortable')) {
-  th.addEventListener('click', () => setSort(th.dataset.field));
-}
+});
 
 function updateSortIndicators() {
-  for (const th of document.querySelectorAll('th.sortable')) {
-    const arrow = th.querySelector('.arrow');
-    arrow.textContent = th.dataset.field === sortField ? (sortDir === 'asc' ? '▲' : '▼') : '';
-  }
+  sortSelect.value = sortField;
+  sortDirBtn.textContent = sortDir === 'asc' ? '▲' : '▼';
 }
 
 async function bulkTag(status) {
@@ -549,62 +571,68 @@ function render() {
 
   rowsEl.innerHTML = '';
   for (const d of visible) {
-    const tr = document.createElement('tr');
-    tr.className = d.status === 'unknown' ? 'row-unknown' : '';
-    if (d.mac === frozenMac) tr.className += ' row-highlight';
-    tr.dataset.mac = d.mac;
+    const card = document.createElement('div');
+    card.className = 'device-card';
+    if (d.status === 'unknown') card.className += ' row-unknown';
+    if (d.mac === frozenMac) card.className += ' row-highlight';
+    card.dataset.mac = d.mac;
 
     const nameCell = d.device_name || '<span class="muted">(no name)</span>';
     const vendorBadge = d.vendor_guess
       ? `<span class="badge vendor ${d.vendor_confidence}" title="Fingerprint/OUI guess -- not proof, and a rescuer's own device matches just as well as a missing person's">${d.vendor_guess}?</span>`
       : '';
-    tr.innerHTML = `
-      <td><span class="badge ${d.status}">${d.status}</span></td>
-      <td>${nameCell} ${vendorBadge}</td>
-      <td class="muted">${d.mac}</td>
-      <td>${d.rssi_dbm ?? '-'}</td>
-      <td>${relTime(d.last_seen)}</td>
-      <td>${d.count}</td>
-      <td><input type="text" value="${d.label ? d.label.replace(/"/g, '&quot;') : ''}" placeholder="label"></td>
-      <td></td>
+    const loc = localizations[d.mac];
+    const confMeta = loc ? `<span title="localization confidence">◎ ${loc.confidence}</span>` : '';
+    card.innerHTML = `
+      <div class="card-head">
+        <span class="badge ${d.status}">${d.status}</span>
+        <span class="dev-name">${nameCell}</span>
+        ${vendorBadge}
+      </div>
+      <div class="card-meta muted">
+        <span class="mac">${d.mac}</span>
+        <span>${d.rssi_dbm ?? '-'} dBm</span>
+        <span>${relTime(d.last_seen)}</span>
+        <span>×${d.count}</span>
+        ${confMeta}
+      </div>
+      <div class="card-actions">
+        <input type="text" value="${d.label ? d.label.replace(/"/g, '&quot;') : ''}" placeholder="label">
+      </div>
     `;
 
-    const labelInput = tr.querySelector('input');
+    const labelInput = card.querySelector('input');
     // Focusing the field locks the view *without* triggering a render
     // (a render here would tear down and recreate this very input,
     // stealing back the focus we're trying to preserve). Blur releases the
-    // lock automatically -- rows no longer need a manual click to
-    // freeze/unfreeze now that sorting keeps row order stable, and a click
-    // handler here would blow away in-progress text selection when copying
-    // a MAC/name out of the table.
+    // lock automatically.
     labelInput.addEventListener('focus', () => setFrozen(d.mac));
     labelInput.addEventListener('blur', () => setFrozen(null));
     labelInput.addEventListener('change', () => tagDevice(d.mac, d.status, labelInput.value));
 
-    const actionsCell = tr.querySelector('td:last-child');
-    const loc = localizations[d.mac];
+    const actions = card.querySelector('.card-actions');
     if (loc) {
       const locBtn = document.createElement('button');
+      locBtn.className = 'locate-btn';
       locBtn.textContent = d.mac === selectedMac ? '◎ locating' : '◎ locate';
       locBtn.title = `Estimated location on map -- confidence ${loc.confidence}, ~${loc.semi_major_m} m`;
-      locBtn.style.marginRight = '8px';
+      // Sits at the top-right of the card head so it's always reachable.
+      card.querySelector('.card-head').appendChild(locBtn);
       locBtn.addEventListener('click', () => selectDevice(d.mac === selectedMac ? null : d.mac));
-      actionsCell.appendChild(locBtn);
     }
     for (const status of ['known', 'unknown', 'ignore']) {
       const btn = document.createElement('button');
       btn.textContent = status;
-      btn.style.marginRight = '4px';
       btn.style.opacity = d.status === status ? '1' : '0.5';
       btn.addEventListener('click', () => {
         tagDevice(d.mac, status, labelInput.value);
         d.status = status; // optimistic local update, shows immediately even while frozen
         render();
       });
-      actionsCell.appendChild(btn);
+      actions.appendChild(btn);
     }
 
-    rowsEl.appendChild(tr);
+    rowsEl.appendChild(card);
   }
 
   renderMap(visible, query);
@@ -1129,6 +1157,14 @@ render();
 // estimates and per-row locate buttons live as a search accumulates samples.
 refreshLocalizations();
 setInterval(refreshLocalizations, 10000);
+
+// Register the offline service worker only in a secure context (HTTPS or
+// localhost) -- browsers refuse SW registration over plain HTTP, so over the
+// field LAN/AP this is simply skipped with no error. It activates
+// automatically if the ground station is later served over HTTPS.
+if ('serviceWorker' in navigator && window.isSecureContext) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+}
 </script>
 </body>
 </html>

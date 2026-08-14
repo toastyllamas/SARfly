@@ -105,6 +105,18 @@ app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+@app.get("/sw.js")
+async def service_worker() -> FileResponse:
+    # Served from the root path (not /static/) so its default scope is "/" and
+    # it can control the whole app, not just /static/. Registered only under
+    # HTTPS/localhost (see index.html) -- a no-op over the field HTTP AP.
+    return FileResponse(
+        STATIC_DIR / "sw.js",
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"},
+    )
+
+
 @app.get("/")
 async def index() -> FileResponse:
     # no-cache = the browser must revalidate with the server before reusing a
